@@ -11,7 +11,9 @@
 | v3.0 | 49.19 | `len=8192` + `util=0.97` + `seqs=128` | seqs=128 → TBT=6ms |
 | v4.0 | 60.02 | `len=8192` + `util=0.97`, no seqs | TBT=4ms — bằng S02 |
 | v5.0 | 61.15 | v4.0 + `--quantization=fp8` | TTFT p95: 76→70ms, TBT=4ms |
-| **v6.0** | **61.41** | v5.0 + `--kv-cache-dtype=fp8_e4m3` | TTFT p50: 45ms, p95: 69ms, 0 accuracy drop |
+| v6.0 | 61.41 | v5.0 + `--kv-cache-dtype=fp8_e4m3` | TTFT p50: 45ms, p95: 69ms, 0 accuracy drop |
+| **v7.0** | **?** | v6.0 + `--block-size=32` + `FLASH_ATTN` + `CUDA_CONN=1` | Target: TBT 4ms→2.5ms → **72-76+ pts** |
+
 
 
 

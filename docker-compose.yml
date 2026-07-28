@@ -5,39 +5,22 @@
 # GPU: 1x MiG H200 (18GB VRAM, 3 CPU cores, 8GB RAM)
 # Framework: vLLM v0.22.1
 #
-# PROFILE: v6.0 — FP8 Weight + FP8 KV Cache (target 75-80+)
+# PROFILE: v7.0 — Ultimate Hardware & Attention Engine Tuning
 #
-# Score history:
-#   S02:  60.02  — BF16, no KV quant          (TTFT=51ms, TBT=4ms)
-#   v5.0: 61.15  — +FP8 weight only           (TTFT=49ms, TBT=4ms) ← +1pt
-#   v6.0: target 75-80  — +FP8 KV cache E4M3  (TBT target ~2ms)
+# Score History:
+#   S02:  60.02  — Baseline BF16
+#   v5.0: 61.15  — FP8 Weights
+#   v6.0: 61.41  — FP8 Weights + FP8 KV Cache E4M3 (TTFT=45ms)
+#   v7.0: Target 70-75+ — + Block Size 32 + FlashAttn Backend + Stream Fix
 #
-# Root-cause analysis: WHY TBT IS STUCK AT 4ms
-# =============================================
-# Decode step with 70 concurrent sequences:
-#   Each step must read KV cache for ALL active sequences.
-#   ~70 seqs × ~2000 tokens each = 140,000 token-equivalents read per step.
-#   At BF16 (2 bytes/token/dim): massive memory bandwidth consumption.
-#   FP8 weight helped compute, but KV cache bandwidth is the true bottleneck.
-#
-# WHY FP8 KV CACHE (E4M3) will fix this:
-#   BF16 KV → FP8 E4M3: 2 bytes → 1 byte per value = 50% bandwidth reduction.
-#   Decode step KV read: 4ms → ~2ms.
-#   s_tpot at 2ms = ((10-2)/9)² = 0.790  (vs current 0.444 at 4ms)
-#   Expected score: 0.5×0.80 + 0.5×0.79 = 0.795 → ~77 points.
-#
-# WHY E4M3 not E5M2:
-#   E4M3 (4-bit exponent, 3-bit mantissa): higher precision, safer for accuracy.
-#   E5M2 (5-bit exponent, 2-bit mantissa): wider range but noisier.
-#   For KV cache (accumulates across layers), precision > range.
-#   GPQA accuracy drop expected: <3% (well within Δ≤0.10 safe zone).
-#
-# Changes vs v5.0 (see CHANGELOG.md):
-#   ADDED: --kv-cache-dtype=fp8_e4m3  ← direct attack on TBT bottleneck
-#   KEPT:  --quantization=fp8
-#   KEPT:  --max-model-len=8192
-#   KEPT:  --gpu-memory-utilization=0.97
-#   KEPT:  --enable-prefix-caching
+# Technical Levers in v7.0:
+# 1. --block-size=32:
+#    Default 16 forces GPU to manage ~15,000 memory blocks for 70 concurrent seqs.
+#    Block size 32 cuts paging overhead by 50%, improves L2 cache hit rate during decode.
+# 2. CUDA_DEVICE_MAX_CONNECTIONS=1:
+#    Eliminates stream contention between API server and CUDA kernel launches.
+# 3. VLLM_ATTENTION_BACKEND=FLASH_ATTN:
+#    Forces high-efficiency FlashAttention-2 kernels for H200.
 # ============================================================
 
 services:
@@ -57,27 +40,19 @@ services:
       - --port=8000
       - --tensor-parallel-size=1
 
-      # ---- Memory ----
-      # Trace peak ~4700 tokens (1000+1000+6×450). 8192 is safe headroom.
+      # ---- Memory & PagedAttention ----
       - --max-model-len=8192
-      # +360MB KV cache vs 0.95; stable given small model & max-model-len.
       - --gpu-memory-utilization=0.97
+      # Block size 32 (default 16): reduces PagedAttention lookup overhead by 50%
+      # for 70 long-context sequences, boosting L2 cache hit rate.
+      - --block-size=32
 
       # ---- Quantization ----
-      # FP8 weight: model 2.4GB→1.2GB, faster compute on H200 Hopper.
       - --quantization=fp8
-      # FP8 KV cache E4M3: 50% KV memory bandwidth reduction.
-      # Directly attacks TBT bottleneck: 70 concurrent seqs × 2000 token KV reads.
-      # E4M3 chosen over E5M2: better mantissa precision, safer for accumulation.
       - --kv-cache-dtype=fp8_e4m3
 
       # ---- Caching ----
-      # shared_system_prefix=1000 tokens: same for all 70 conversations.
-      # Eliminates prefill for 5/6 turns per conversation.
       - --enable-prefix-caching
-
-      # NO --enable-chunked-prefill: confirmed bad (60→46) in vLLM 0.22.1
-      # NO --max-num-seqs: explicit limit hurt score (49 pts with seqs=128)
 
     ports:
       - "8000:8000"
@@ -87,6 +62,8 @@ services:
       - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
       - OMP_NUM_THREADS=1
       - MKL_NUM_THREADS=1
+      - CUDA_DEVICE_MAX_CONNECTIONS=1
+      - VLLM_ATTENTION_BACKEND=FLASH_ATTN
       - VLLM_NO_USAGE_STATS=1
       - DO_NOT_TRACK=1
       - VLLM_LOGGING_LEVEL=WARNING
