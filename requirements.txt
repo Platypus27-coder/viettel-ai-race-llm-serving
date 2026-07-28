@@ -1,0 +1,12 @@
+# Viettel AI Race 2026 — Python Dependencies
+# Install: pip install -r requirements.txt
+
+# Benchmark & Testing
+aiohttp>=3.9.0
+openai>=1.0.0
+numpy>=1.24.0
+transformers>=4.57.2
+
+# Official GPQA evaluation (optional — large install)
+# Install on Colab when running the full accuracy gate:
+# pip install "lm-eval[api]>=0.4.9"

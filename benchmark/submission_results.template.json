@@ -1,0 +1,37 @@
+{
+  "selection_policy": {
+    "minimum_accuracy": 0.32,
+    "preferred_accuracy": 0.35,
+    "ers_tie_threshold": 0.01,
+    "ers_scale": "accepts 0..1 or portal points 0..100",
+    "tie_breakers": [
+      "higher_accuracy",
+      "lower_p95_ttft_ms"
+    ]
+  },
+  "submissions": [
+    {
+      "slot": 1,
+      "submission_id": null,
+      "compose_file": "configs/docker-compose.slot-03-bf16-batch4096-seqs64.yml",
+      "compose_sha256": null,
+      "ers": null,
+      "ers_normalized": null,
+      "accuracy": null,
+      "accuracy_drop": null,
+      "f_delta": null,
+      "penalty": null,
+      "final_score": null,
+      "p50_ttft_ms": null,
+      "p95_ttft_ms": null,
+      "p95_tpot_ms": null,
+      "tbt_median_ms": null,
+      "successful_requests": null,
+      "failed_requests": null,
+      "warmup_count": null,
+      "portal_valid": null,
+      "status": null,
+      "notes": "BF16 recovery candidate: batch4096/seqs64"
+    }
+  ]
+}

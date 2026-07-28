@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Benchmark results
+benchmark/benchmark_results.json
+benchmark/comparison_results.json
+benchmark/gpqa_results/
+benchmark/results/
+configs/generated-*.yml
+benchmark/submission_results.json
+
+# Model weights (too large for git)
+model/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+__MACOSX/
+
+# Docker
+*.tar

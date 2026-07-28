@@ -1,0 +1,67 @@
+# ============================================================
+# Viettel AI Race 2026 — SUBMISSION FILE
+# ============================================================
+# Model: LiquidAI/LFM2.5-1.2B-Instruct
+# GPU: 1x MiG H200 (18GB VRAM, 3 CPU cores, 8GB RAM)
+# Framework: vLLM v0.22.1
+#
+# PROFILE: SUBMISSION 3 — BF16 RECOVERY
+# Portal evidence: 8192 batched tokens / 80 sequences scored 48.2.
+# This candidate restores the lower-TBT 4096 / 64 scheduling region.
+# ============================================================
+
+services:
+  model:
+    # === OPTION A: Use baseline image (safe, no custom build) ===
+    image: vllm/vllm-openai:v0.22.1
+    # === OPTION B: Use custom image (uncomment after build+push) ===
+    # image: YOUR_DOCKERHUB_USERNAME/viettel-ai-vllm:v1
+
+    entrypoint:
+      - python3                                        # DO NOT CHANGE
+      - -m                                             # DO NOT CHANGE
+      - vllm.entrypoints.openai.api_server             # DO NOT CHANGE
+
+    command:
+      # ---- Core (DO NOT CHANGE) ----
+      - --model=/model
+      - --served-model-name=LFM2.5-1.2B-Instruct
+      - --host=0.0.0.0
+      - --port=8000
+      - --tensor-parallel-size=1
+
+      # ---- Memory ----
+      - --gpu-memory-utilization=0.95
+      # Published trace peaks below 4.7K tokens including the current output.
+      - --max-model-len=8192
+
+      # ---- Caching ----
+      # Critical: workload has shared system prefix + multi-turn reuse
+      - --enable-prefix-caching
+
+      # ---- Batching & Scheduling ----
+      # Chunked prefill: prevents long prefills from blocking decode
+      - --enable-chunked-prefill
+      - --max-num-batched-tokens=4096
+      # At most one active request per each of the 70 conversations.
+      - --max-num-seqs=64
+
+    ports:
+      - "8000:8000"
+    shm_size: "2g"
+
+    environment:
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+      - OMP_NUM_THREADS=1
+      - MKL_NUM_THREADS=1
+      - VLLM_NO_USAGE_STATS=1
+      - DO_NOT_TRACK=1
+      - VLLM_LOGGING_LEVEL=WARNING
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

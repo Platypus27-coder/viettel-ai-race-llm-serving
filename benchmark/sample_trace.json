@@ -1,0 +1,15 @@
+{
+    "num_conversations": 10,
+    "user_turns_per_conversation": 5,
+    "total_request": 50,
+    "shared_system_prefix_tokens": 200,
+    "per_conversation_prefix_tokens": 100,
+    "new_user_tokens_per_turn": 50,
+    "output_tokens_per_turn_pinned": 150,
+    "arrival": {
+        "type": "staggered",
+        "delay": 0.1,
+        "think_time": 0.5
+    },
+    "_comment": "This is a synthetic trace for local testing. The actual competition trace is provided by BTC and may have different parameters."
+}
