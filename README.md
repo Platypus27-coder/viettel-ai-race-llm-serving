@@ -62,10 +62,21 @@ Docker/Linux on a GPU or in Colab.
 1. Open the GitHub-hosted notebook using the Colab link above.
 2. Select a T4 runtime.
 3. Run the setup cell; it clones or fast-forwards the repository under
-   `/content/viettel-ai-race-llm-serving`.
+   `/content/viettel-ai-race-llm-serving` and installs the `cu129` wheel of
+   `vllm==0.22.1`.
 4. Start a clean server and run the 420-request workload.
 5. Run the quick accuracy check and full GPQA for every quantized candidate.
 6. Download the benchmark JSON, GPQA results, and `vllm.log`.
+
+The default PyPI wheel for vLLM 0.22.1 requires CUDA 13 and fails on the Colab
+T4 runtime with `libcudart.so.13` missing. The notebook therefore installs from
+`https://wheels.vllm.ai/0.22.1/cu129` using `uv --torch-backend=cu129` and
+verifies `vllm._C` in a subprocess before downloading the model. If a broken
+CUDA 13 installation has already been imported, restart the Colab session and
+rerun from the setup cell.
+
+This compatibility choice applies only to Colab. Portal submissions continue
+to use the official `vllm/vllm-openai:v0.22.1` image on H200.
 
 Do not compare T4 latency between BF16/FP16 and FP8 to select the H200
 submission. T4 does not execute the same native W8A8 path as Hopper.
