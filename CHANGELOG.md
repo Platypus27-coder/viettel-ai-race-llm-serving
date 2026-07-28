@@ -10,8 +10,9 @@
 | S04 | 46 | +chunked-prefill + `seqs=64` + `batched=4096` | Chunked phá cache |
 | v3.0 | 49.19 | `len=8192` + `util=0.97` + `seqs=128` | seqs=128 → TBT=6ms |
 | v4.0 | 60.02 | `len=8192` + `util=0.97`, no seqs | TBT=4ms — bằng S02 |
-| **v5.0** | **61.15** | v4.0 + `--quantization=fp8` | TTFT p95: 76→70ms, TBT vẫn 4ms |
-| **v6.0** | **?** | v5.0 + **`--kv-cache-dtype=fp8_e4m3`** | Target: TBT 4ms→2ms → **~77 pts** |
+| v5.0 | 61.15 | v4.0 + `--quantization=fp8` | TTFT p95: 76→70ms, TBT=4ms |
+| **v6.0** | **61.41** | v5.0 + `--kv-cache-dtype=fp8_e4m3` | TTFT p50: 45ms, p95: 69ms, 0 accuracy drop |
+
 
 
 ### Phân tích v3.0 thất bại (49 điểm):
