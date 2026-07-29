@@ -1,29 +1,29 @@
-name: Publish and pin ShortConv FP8 image
+name: Publish and pin ShortConv FP8 Docker Hub image
 
+# The contest requires the custom serving image to be in a public Docker Hub
+# repository. Run this manually after adding the DOCKERHUB_TOKEN repository
+# secret; it then verifies anonymous pull access before changing the root
+# submission artifact.
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - Dockerfile
-      - docker/**
-      - .github/workflows/publish-shortconv-fp8.yml
+    inputs:
+      dockerhub_namespace:
+        description: Docker Hub username or organization that owns viettel-ai-vllm
+        required: true
+        type: string
 
-# The build uses GitHub's short-lived token: no Docker Hub credential or local
-# Docker daemon is required. The package is linked to this repository through
-# the OCI source label set below.
 permissions:
   contents: read
-  packages: write
 
 concurrency:
-  group: publish-shortconv-fp8-main
+  group: publish-shortconv-fp8-dockerhub
   cancel-in-progress: false
 
 jobs:
   build:
-    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       digest: ${{ steps.build.outputs.digest }}
       image_name: ${{ steps.image.outputs.name }}
@@ -31,22 +31,39 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
-      - name: Resolve immutable GHCR name
-        id: image
+      - name: Require Docker Hub access token
+        env:
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         shell: bash
         run: |
-          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/viettel-ai-vllm"
-          echo "name=${image}" >> "$GITHUB_OUTPUT"
+          if [ -z "$DOCKERHUB_TOKEN" ]; then
+            echo "Set repository secret DOCKERHUB_TOKEN to a Docker Hub access token, then rerun." >&2
+            exit 1
+          fi
+
+      - name: Resolve Docker Hub image name
+        id: image
+        env:
+          NAMESPACE: ${{ inputs.dockerhub_namespace }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          namespace="${NAMESPACE,,}"
+          if ! [[ "$namespace" =~ ^[a-z0-9][a-z0-9._-]*$ ]]; then
+            echo "Docker Hub namespace is invalid: $NAMESPACE" >&2
+            exit 1
+          fi
+          echo "name=${namespace}/viettel-ai-vllm" >> "$GITHUB_OUTPUT"
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to GHCR
+      - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          registry: docker.io
+          username: ${{ inputs.dockerhub_namespace }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build and publish ShortConv FP8 image
         id: build
@@ -67,45 +84,42 @@ jobs:
       - name: Publish build result
         run: |
           {
-            echo "## ShortConv FP8 image"
+            echo "## ShortConv FP8 Docker Hub image"
             echo "\`${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
   verify-public-pull:
     needs: build
-    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
-      - name: Require anonymous GHCR manifest access
+      - name: Require anonymous Docker Hub manifest access
         env:
           IMAGE: ${{ needs.build.outputs.image_name }}
           DIGEST: ${{ needs.build.outputs.digest }}
         shell: bash
         run: |
           set -euo pipefail
-          repository="${IMAGE#ghcr.io/}"
           token="$(curl --fail --silent --show-error \
-            "https://ghcr.io/token?service=ghcr.io&scope=repository:${repository}:pull" \
+            "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${IMAGE}:pull" \
             | jq -r '.token // .access_token // empty')"
           if [ -z "$token" ]; then
-            echo "GHCR did not issue an anonymous pull token for ${IMAGE}." >&2
+            echo "Docker Hub did not issue an anonymous pull token for ${IMAGE}." >&2
             exit 1
           fi
           status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
             --header "Authorization: Bearer ${token}" \
             --header 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
-            "https://ghcr.io/v2/${repository}/manifests/${DIGEST}")"
+            "https://registry-1.docker.io/v2/${IMAGE}/manifests/${DIGEST}")"
           if [ "$status" != 200 ]; then
             echo "${IMAGE}@${DIGEST} is not anonymously pullable (HTTP ${status})." >&2
-            echo "Make the GHCR package public in its Package settings, then rerun this workflow." >&2
+            echo "Make the Docker Hub repository public, then rerun this workflow." >&2
             exit 1
           fi
 
   pin-compose:
     needs: [build, verify-public-pull]
-    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -135,5 +149,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add docker-compose.yml
-          git commit -m "chore: pin shortconv-fp8 image digest"
+          git commit -m "chore: pin shortconv-fp8 Docker Hub digest"
           git push origin HEAD:main

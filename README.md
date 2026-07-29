@@ -151,21 +151,25 @@ The `Dockerfile` pins the official vLLM `v0.22.1` base by digest and aborts if
 the expected source anchors differ. A standard build contains just the
 ShortConv FP8 patch:
 
-### Recommended: GitHub Actions / GHCR
+### Required: public Docker Hub image
 
-No Docker Hub username or local Docker daemon is needed. The tracked workflow
-[`publish-shortconv-fp8.yml`](.github/workflows/publish-shortconv-fp8.yml)
-runs when the Docker patch changes (or from **Actions → Run workflow**). It
-builds a GHCR image, verifies that the digest can be pulled anonymously,
-validates Compose, and commits the resulting `shortconv-fp8`
-`docker-compose.yml` to `main`.
+The contest rules require a custom image in a **public Docker Hub** repository;
+a GHCR image is therefore not a valid portal artifact. A Docker Hub namespace
+is unavoidable because it becomes part of the submitted image reference.
 
-Wait for all workflow jobs to succeed, then submit the root
-`docker-compose.yml` from that resulting commit. If GitHub shows the new GHCR
-package as private, make that package public once in its Package settings: the
-contest portal has no GitHub credentials with which to pull it.
+No local Docker daemon is needed. To publish through GitHub Actions, create a
+Docker Hub access token with read/write access, add it once as the repository
+Actions secret `DOCKERHUB_TOKEN` (never paste it into a notebook or chat), and
+then run [`publish-shortconv-fp8.yml`](.github/workflows/publish-shortconv-fp8.yml)
+from **Actions → Run workflow**. Enter the Docker Hub username or organization
+namespace that owns the public `viettel-ai-vllm` repository.
 
-### Fallback: local Docker / Docker Hub
+The workflow builds the image, confirms anonymous Docker Hub pull access,
+validates Compose, and only then commits a digest-pinned `shortconv-fp8`
+root `docker-compose.yml`. Until that workflow succeeds, the root Compose
+stays on the valid official-image v6 incumbent.
+
+### Alternative: local Docker / Docker Hub
 
 ```powershell
 docker build -t DOCKERHUB_USER/viettel-ai-vllm:shortconv-fp8 .
