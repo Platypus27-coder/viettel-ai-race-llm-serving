@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import ast
 import importlib.metadata
+import importlib.util
 import sys
 from pathlib import Path
 
@@ -203,20 +204,27 @@ def _verify(short_conv_source: str, lfm2_source: str) -> None:
 
 
 def _resolve_vllm_root(root_argument: str | None) -> Path:
-    if root_argument is not None:
-        return Path(root_argument).resolve()
-
     try:
         distribution_version = importlib.metadata.version("vllm")
-        import vllm
     except Exception as exc:  # pragma: no cover - used only in image build
-        raise PatchError("Cannot import the installed vLLM package.") from exc
+        raise PatchError("Cannot inspect the installed vLLM distribution.") from exc
 
     if distribution_version != EXPECTED_VERSION:
         raise PatchError(
             f"vLLM {EXPECTED_VERSION} is required, found {distribution_version}."
         )
-    return Path(vllm.__file__).resolve().parent
+    if root_argument is not None:
+        root = Path(root_argument).resolve()
+        if not root.is_dir():
+            raise PatchError(f"vLLM package root does not exist: {root}")
+        return root
+
+    # Do not import vllm just to locate its files. A Docker build host has no
+    # NVIDIA driver, while importing the CUDA extension can require one.
+    spec = importlib.util.find_spec("vllm")
+    if spec is None or not spec.submodule_search_locations:
+        raise PatchError("Cannot locate the installed vLLM package.")
+    return Path(next(iter(spec.submodule_search_locations))).resolve()
 
 
 def main() -> int:

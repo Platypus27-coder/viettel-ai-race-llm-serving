@@ -151,6 +151,22 @@ The `Dockerfile` pins the official vLLM `v0.22.1` base by digest and aborts if
 the expected source anchors differ. A standard build contains just the
 ShortConv FP8 patch:
 
+### Recommended: GitHub Actions / GHCR
+
+No Docker Hub username or local Docker daemon is needed. The tracked workflow
+[`publish-shortconv-fp8.yml`](.github/workflows/publish-shortconv-fp8.yml)
+runs when the Docker patch changes (or from **Actions → Run workflow**). It
+builds a GHCR image, verifies that the digest can be pulled anonymously,
+validates Compose, and commits the resulting `shortconv-fp8`
+`docker-compose.yml` to `main`.
+
+Wait for all workflow jobs to succeed, then submit the root
+`docker-compose.yml` from that resulting commit. If GitHub shows the new GHCR
+package as private, make that package public once in its Package settings: the
+contest portal has no GitHub credentials with which to pull it.
+
+### Fallback: local Docker / Docker Hub
+
 ```powershell
 docker build -t DOCKERHUB_USER/viettel-ai-vllm:shortconv-fp8 .
 ```
