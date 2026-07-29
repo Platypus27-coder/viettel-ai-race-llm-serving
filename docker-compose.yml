@@ -1,3 +1,6 @@
+# Controlled candidate: shortconv-fp8
+# Source v6 Compose SHA-256: 2a9b7c682ff3829630b9938a76f21ec43e88e0e8f4ec0122ee135b0d19f5e348
+# Change: v6 with the custom image that quantizes ShortConv projections.
 # ============================================================
 # Viettel AI Race 2026 — SUBMISSION FILE
 # ============================================================
@@ -17,7 +20,7 @@
 
 services:
   model:
-    image: vllm/vllm-openai:v0.22.1
+    image: ghcr.io/platypus27-coder/viettel-ai-vllm@sha256:5bed5ba51fcee6ff6f3a35c32452d5b377215e2bd1509ebab68394f0773a5f5f
 
     entrypoint:
       - python3                             # DO NOT CHANGE
