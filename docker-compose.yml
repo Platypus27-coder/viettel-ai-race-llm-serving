@@ -5,14 +5,14 @@
 # GPU: 1x MiG H200 (18GB VRAM, 3 CPU cores, 8GB RAM)
 # Framework: vLLM v0.22.1
 #
-# PROFILE: v8.1 — Validated Supported CLI Optimization Flags
+# PROFILE: v6.0 (BEST PERFORMING SUBMISSION — SCORE 61.41)
 #
-# Fixes: Removed --num-scheduler-steps (unsupported by CLI entrypoint).
-# Added BTC-supported flags:
-# 1. --async-scheduling: Asynchronous scheduling loop to reduce CPU overhead.
-# 2. --performance-mode=interactivity: Optimizes scheduler for lowest TPOT/TTFT.
-# 3. --max-model-len=5120: Fits peak workload (4700), frees VRAM.
-# 4. --max-num-seqs=48: Caps concurrent decode to prevent memory bandwidth saturation.
+# Score Breakdown:
+#   Score: 61.4100
+#   TTFT p50: 45ms
+#   TTFT p95: 69ms
+#   Failed requests: 5 / 420 (98.8% success)
+#   Accuracy drop: 0 (f_delta = 1.0)
 # ============================================================
 
 services:
@@ -32,14 +32,9 @@ services:
       - --port=8000
       - --tensor-parallel-size=1
 
-      # ---- Memory & Performance ----
-      - --max-model-len=5120
+      # ---- Memory & Cache ----
+      - --max-model-len=8192
       - --gpu-memory-utilization=0.97
-      - --max-num-seqs=48
-
-      # ---- Scheduling & Interactivity (Supported CLI flags) ----
-      - --async-scheduling
-      - --performance-mode=interactivity
 
       # ---- Quantization ----
       - --quantization=fp8
@@ -56,7 +51,6 @@ services:
       - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
       - OMP_NUM_THREADS=1
       - MKL_NUM_THREADS=1
-      - CUDA_DEVICE_MAX_CONNECTIONS=1
       - VLLM_NO_USAGE_STATS=1
       - DO_NOT_TRACK=1
       - VLLM_LOGGING_LEVEL=WARNING
