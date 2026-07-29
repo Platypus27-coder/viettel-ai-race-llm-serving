@@ -10,8 +10,7 @@ benchmark/benchmark_results.json
 benchmark/comparison_results.json
 benchmark/gpqa_results/
 benchmark/results/
-configs/generated-*.yml
-benchmark/submission_results.json
+artifacts/
 
 # Model weights (too large for git)
 model/

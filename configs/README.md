@@ -1,14 +1,47 @@
-# Configuration Matrix
+# Configuration references
 
-This directory contains reference configurations for the Viettel AI Race 2026 inference challenge.
+`../docker-compose.yml` is the only active portal artifact. It remains v6.0
+(61.41) until a reviewed candidate is deliberately promoted to the root.
 
-## Active Artifacts
+This directory is not a second submission tree:
 
-- **Root Artifact**: `docker-compose.yml`  
-  The active submission file containing the peak-performing **v6.0 profile** (Score: **61.4100**, FP8 Weights + FP8 KV Cache E4M3).
-- **Baseline Reference**: `configs/docker-compose.baseline.yml`  
-  The official BTC baseline configuration (BF16, prefix caching, 0.95 GPU utilization).
+- `docker-compose.baseline.yml` is the BTC BF16 reference only.
+- Temporary controlled candidates belong in ignored `../artifacts/`, generated
+  from the root by `scripts/select_submission.py`.
 
-## Cleaned Obsolete Configurations
+## Render a controlled candidate
 
-All outdated/failed candidate configurations (such as the 48.2-point `batch8192/seqs80` run, legacy slot candidates, and experimental flags) have been cleaned up to maintain a lean, reproducible codebase.
+All candidates start from the root v6 Compose file. The renderer refuses a
+source that already contains scheduler experiments and refuses a custom-image
+tag without an immutable SHA-256 digest.
+
+```powershell
+# v6 plus the ShortConv FP8 custom image; no command flags change.
+conda run -n viettel python ..\scripts\select_submission.py `
+  --candidate shortconv-fp8 `
+  --custom-image 'DOCKERHUB_USER/viettel-ai-vllm:shortconv-fp8@sha256:<64-hex>' `
+  --output ..\artifacts\shortconv-fp8.yml
+
+# Same winner plus the baked local draft model, 4 draft tokens, TP=1.
+conda run -n viettel python ..\scripts\select_submission.py `
+  --candidate speculative-draft `
+  --custom-image 'DOCKERHUB_USER/viettel-ai-vllm:shortconv-fp8-draft350@sha256:<64-hex>' `
+  --output ..\artifacts\speculative-draft.yml
+
+# Scheduler-only experiments, run after choosing the better parent.
+conda run -n viettel python ..\scripts\select_submission.py `
+  --candidate batch1536 --output ..\artifacts\batch1536.yml
+conda run -n viettel python ..\scripts\select_submission.py `
+  --candidate batch1024 --output ..\artifacts\batch1024.yml
+```
+
+Before the portal, validate the exact generated file:
+
+```powershell
+docker compose -f ..\artifacts\shortconv-fp8.yml config --quiet
+```
+
+Use `--output ../docker-compose.yml --promote` only after review, immediately
+before uploading that exact root artifact. Record its SHA-256, image digest,
+startup log, GPQA artifact, 420-request preflight, portal ID, and score in
+`../benchmark/submission_results.json`.

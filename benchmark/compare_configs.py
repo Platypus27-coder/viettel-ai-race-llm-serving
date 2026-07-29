@@ -1,167 +1,226 @@
-"""
-Viettel AI Race 2026 — A/B Config Tester
-==========================================
-Compares different docker-compose configurations to find the optimal setup.
+"""Run explicit, controlled Compose candidates against the same workload.
 
-Usage:
-    python compare_configs.py --configs baseline recovery tbt
+Examples:
+    conda run -n viettel python benchmark/compare_configs.py \
+        --compose incumbent=docker-compose.yml \
+        --compose shortconv=artifacts/shortconv-fp8.yml
+
+No profile name resolves to a deleted Compose file.  Every comparison target is
+spelled out on the command line, with the root v6 Compose as the default.
 """
 
+from __future__ import annotations
+
+import argparse
 import asyncio
+import hashlib
 import json
 import subprocess
-import time
 import sys
-import os
-import argparse
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
-# Add parent dir to path for benchmark import
-sys.path.insert(0, os.path.dirname(__file__))
-from benchmark_ers import (
-    ArrivalConfig,
+
+sys.path.insert(0, str(Path(__file__).parent))
+from benchmark_ers import (  # noqa: E402
     TraceConfig,
     load_tokenizer,
     load_trace,
+    parse_rate,
+    reset_prefix_cache,
     run_benchmark,
 )
 
 
-COMPOSE_DIR = os.path.dirname(os.path.dirname(__file__))
-
-CONFIG_PROFILES = {
-    "baseline": {
-        "file": "configs/docker-compose.baseline.yml",
-        "description": "BTC baseline (BF16, prefix caching, 0.95 mem)",
-    },
-    "recovery": {
-        "file": "docker-compose.yml",
-        "description": "Submission 3 recovery (BF16, batch 4096, seqs 64)",
-    },
-    "tbt": {
-        "file": "configs/docker-compose.slot-04-bf16-batch2048-seqs64.yml",
-        "description": "Submission 4 TBT priority (BF16, batch 2048, seqs 64)",
-    },
-}
+PROJECT_DIR = Path(__file__).resolve().parents[1]
+DEFAULT_TRACE = (
+    PROJECT_DIR
+    / "019e649f-4e27-74db-82da-920f57b13786"
+    / "grading-workload-spec.json"
+)
 
 
-async def test_config(
-    config_name: str,
-    compose_file: str,
+@dataclass(frozen=True)
+class ComposeTarget:
+    name: str
+    path: Path
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def image_reference(path: Path) -> str | None:
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("image:"):
+            return stripped.split(":", maxsplit=1)[1].strip().strip("'\"")
+    return None
+
+
+def parse_target(value: str) -> ComposeTarget:
+    """Parse NAME=PATH and reject ambiguous implicit profile names."""
+    if "=" not in value:
+        raise argparse.ArgumentTypeError(
+            "--compose must use NAME=PATH, for example incumbent=docker-compose.yml"
+        )
+    name, raw_path = value.split("=", maxsplit=1)
+    if not name or not raw_path:
+        raise argparse.ArgumentTypeError("--compose requires a non-empty NAME and PATH")
+    path = Path(raw_path).resolve()
+    if not path.is_file():
+        raise argparse.ArgumentTypeError(f"Compose file does not exist: {path}")
+    return ComposeTarget(name=name, path=path)
+
+
+async def test_target(
+    target: ComposeTarget,
     trace: TraceConfig,
-    tokenizer,
-    base_url: str = "http://localhost:8000",
-) -> dict:
-    """Test a single configuration and return results."""
-    print(f"\n{'#'*60}")
-    print(f"  Testing: {config_name}")
-    print(f"  File: {compose_file}")
-    print(f"{'#'*60}\n")
-
-    compose_path = os.path.join(COMPOSE_DIR, compose_file)
-
-    # Start the container
-    print("Starting container...")
+    tokenizer: Any,
+    base_url: str,
+    runs: int,
+) -> dict[str, Any]:
+    """Start one explicit Compose file, benchmark it, then always stop it."""
+    print(f"\n{'#' * 60}\nTesting: {target.name}\nCompose: {target.path}\n{'#' * 60}")
     subprocess.run(
-        ["docker", "compose", "-f", compose_path, "up", "-d"],
-        cwd=COMPOSE_DIR,
+        ["docker", "compose", "-f", str(target.path), "config", "--quiet"],
+        cwd=PROJECT_DIR,
         check=True,
     )
-
+    subprocess.run(
+        ["docker", "compose", "-f", str(target.path), "up", "-d"],
+        cwd=PROJECT_DIR,
+        check=True,
+    )
+    summaries: list[dict[str, Any]] = []
     try:
-        summary = await run_benchmark(base_url, trace, tokenizer)
-        return {
-            "config": config_name,
-            "ers": summary["ers"],
-            "score_max": summary["score_if_accuracy_safe"],
-            "successful_requests": summary["successful_requests"],
-            "total_requests": summary["expected_requests"],
-            "mean_ttft_ms": summary["ttft_ms"].get("mean"),
-            "mean_tpot_ms": summary["tpot_ms"].get("mean"),
-            "p95_ttft_ms": summary["ttft_ms"].get("p95"),
-            "p95_tpot_ms": summary["tpot_ms"].get("p95"),
-            "config_fingerprint": summary["config_fingerprint"],
-        }
+        for index in range(runs):
+            if index:
+                await reset_prefix_cache(base_url)
+            summary = await run_benchmark(base_url, trace, tokenizer)
+            summary["run_index"] = index + 1
+            summaries.append(summary)
     finally:
-        # Stop the container
-        print(f"\nStopping container for {config_name}...")
+        print(f"Stopping: {target.name}")
         subprocess.run(
-            ["docker", "compose", "-f", compose_path, "down"],
-            cwd=COMPOSE_DIR,
+            ["docker", "compose", "-f", str(target.path), "down"],
+            cwd=PROJECT_DIR,
+            check=False,
         )
-        await asyncio.sleep(5)
+
+    return {
+        "candidate": target.name,
+        "compose_file": str(target.path),
+        "compose_sha256": sha256(target.path),
+        "image_reference": image_reference(target.path),
+        "runs": summaries,
+    }
 
 
-async def compare_all(configs: list[str], trace: TraceConfig, tokenizer):
-    """Compare multiple configurations."""
-    results = []
+def _latest_summary(result: dict[str, Any]) -> dict[str, Any]:
+    runs = result.get("runs") or []
+    return runs[-1] if runs else {}
 
-    for config_name in configs:
-        if config_name not in CONFIG_PROFILES:
-            print(f"Unknown config: {config_name}")
-            continue
 
-        profile = CONFIG_PROFILES[config_name]
-        result = await test_config(
-            config_name, profile["file"], trace, tokenizer
-        )
-        results.append(result)
-
-    # Print comparison table
-    print(f"\n{'='*80}")
-    print(f"  📊 CONFIGURATION COMPARISON")
-    print(f"{'='*80}")
-    print(f"  {'Config':<15} {'ERS':>8} {'Score':>8} {'TTFT(ms)':>10} {'TPOT(ms)':>10} {'Success':>10}")
-    print(f"  {'─'*73}")
-
-    best_ers = max((r["ers"] for r in results), default=0)
-    for r in results:
-        marker = " 🏆" if r["ers"] == best_ers and len(results) > 1 else ""
-        mean_ttft = r["mean_ttft_ms"] if r["mean_ttft_ms"] is not None else float("nan")
-        mean_tpot = r["mean_tpot_ms"] if r["mean_tpot_ms"] is not None else float("nan")
+def print_comparison(results: list[dict[str, Any]]) -> None:
+    print(f"\n{'=' * 92}")
+    print("CONTROLLED CONFIGURATION COMPARISON")
+    print(f"{'=' * 92}")
+    print(
+        f"{'Candidate':<22} {'ERS':>8} {'TTFT p95(ms)':>14} "
+        f"{'TPOT p95(ms)':>14} {'Success':>12}"
+    )
+    print("-" * 92)
+    for result in results:
+        summary = _latest_summary(result)
+        ttft = summary.get("ttft_ms", {})
+        tpot = summary.get("tpot_ms", {})
         print(
-            f"  {r['config']:<15} {r['ers']:>8.4f} {r['score_max']:>8.2f} "
-            f"{mean_ttft:>10.2f} {mean_tpot:>10.3f} "
-            f"{r['successful_requests']}/{r['total_requests']}{marker}"
+            f"{result['candidate']:<22} {summary.get('ers', float('nan')):>8.4f} "
+            f"{ttft.get('p95', float('nan')):>14.2f} "
+            f"{tpot.get('p95', float('nan')):>14.3f} "
+            f"{summary.get('successful_requests', 0)}/"
+            f"{summary.get('expected_requests', 0):<7}"
         )
-    print()
-
-    # Save comparison
-    out_path = os.path.join(os.path.dirname(__file__), "comparison_results.json")
-    with open(out_path, "w") as f:
-        json.dump(results, f, indent=2)
-    print(f"  📁 Results saved to: {out_path}")
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Viettel AI Race 2026 — Config Comparison"
-    )
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--configs", nargs="+", default=["baseline", "recovery", "tbt"],
-        choices=list(CONFIG_PROFILES.keys()),
-        help="Configurations to compare"
+        "--compose",
+        action="append",
+        type=parse_target,
+        help="Explicit NAME=PATH candidate. Repeat for each candidate.",
     )
-    parser.add_argument("--conversations", type=int, default=5)
-    parser.add_argument("--turns", type=int, default=3)
-    parser.add_argument("--trace")
-    parser.add_argument("--request-rate", type=float, default=float("inf"))
+    parser.add_argument("--trace", default=str(DEFAULT_TRACE))
+    parser.add_argument("--request-rate", default="inf")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--runs", type=int, default=1)
     parser.add_argument(
         "--tokenizer-path", default="LiquidAI/LFM2.5-1.2B-Instruct"
     )
-    args = parser.parse_args()
+    parser.add_argument("--base-url", default="http://localhost:8000")
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("benchmark/comparison_results.json"),
+    )
+    return parser
 
-    if args.trace:
-        trace = load_trace(args.trace, request_rate=args.request_rate)
-    else:
-        trace = TraceConfig(
-            num_conversations=args.conversations,
-            user_turns_per_conversation=args.turns,
-            arrival=ArrivalConfig(request_rate=args.request_rate),
-        )
+
+async def async_main(args: argparse.Namespace) -> int:
+    if args.runs < 1:
+        raise ValueError("--runs must be at least 1")
+    targets = args.compose or [
+        ComposeTarget("v6-incumbent", (PROJECT_DIR / "docker-compose.yml").resolve())
+    ]
+    names = [target.name for target in targets]
+    if len(names) != len(set(names)):
+        raise ValueError("Each --compose NAME must be unique")
+
+    trace = load_trace(
+        args.trace,
+        request_rate=parse_rate(args.request_rate),
+        seed=args.seed,
+    )
     tokenizer = load_tokenizer(args.tokenizer_path)
+    results = []
+    for target in targets:
+        results.append(
+            await test_target(target, trace, tokenizer, args.base_url, args.runs)
+        )
+    print_comparison(results)
 
-    asyncio.run(compare_all(args.configs, trace, tokenizer))
+    output = args.output.resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    report = {
+        "generated_at_unix": time.time(),
+        "trace": {
+            "path": str(Path(args.trace).resolve()),
+            "request_rate": args.request_rate,
+            "seed": args.seed,
+            "runs_per_candidate": args.runs,
+        },
+        "results": results,
+    }
+    output.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"Results saved to: {output}")
+    return 0
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    try:
+        return asyncio.run(async_main(args))
+    except ValueError as exc:
+        raise SystemExit(f"error: {exc}") from exc
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

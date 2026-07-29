@@ -1,80 +1,116 @@
-# ============================================================
-# Viettel AI Race 2026 — Run locally for testing
-# ============================================================
-# PowerShell script
+# Viettel AI Race 2026 - local smoke-test runner.
+# docker-compose.yml is the v6 incumbent and the only default artifact.
 
 param(
-    [Parameter(Mandatory=$false)]
-    [ValidateSet("recovery", "tbt", "baseline")]
-    [string]$Profile = "recovery",
+    [Parameter(Mandatory = $false)]
+    [string]$ComposeFile = "docker-compose.yml",
 
-    [Parameter(Mandatory=$false)]
+    [Parameter(Mandatory = $false)]
     [switch]$Detached,
 
-    [Parameter(Mandatory=$false)]
+    [Parameter(Mandatory = $false)]
     [switch]$Stop,
 
-    [Parameter(Mandatory=$false)]
+    [Parameter(Mandatory = $false)]
     [switch]$Benchmark,
 
-    [Parameter(Mandatory=$false)]
-    [switch]$TestAccuracy
+    [Parameter(Mandatory = $false)]
+    [switch]$TestAccuracy,
+
+    [Parameter(Mandatory = $false)]
+    [ValidateSet("quick", "gpqa")]
+    [string]$AccuracyMode = "quick",
+
+    [Parameter(Mandatory = $false)]
+    [string]$BenchmarkOutput,
+
+    [Parameter(Mandatory = $false)]
+    [int]$HealthTimeoutSeconds = 120
 )
 
 $ErrorActionPreference = "Stop"
 $ProjectDir = Split-Path -Parent $PSScriptRoot
 
-# Map profile to compose file
-$composeFiles = @{
-    "recovery" = "docker-compose.yml"
-    "tbt"      = "configs\docker-compose.slot-04-bf16-batch2048-seqs64.yml"
-    "baseline" = "configs\docker-compose.baseline.yml"
+if ([IO.Path]::IsPathRooted($ComposeFile)) {
+    $ComposeCandidate = $ComposeFile
+} else {
+    $ComposeCandidate = Join-Path $ProjectDir $ComposeFile
 }
-$composeFile = Join-Path $ProjectDir $composeFiles[$Profile]
+if (-not (Test-Path -LiteralPath $ComposeCandidate -PathType Leaf)) {
+    throw "Compose file does not exist: $ComposeCandidate"
+}
+$ComposePath = (Resolve-Path -LiteralPath $ComposeCandidate).Path
+$BaseUrl = "http://localhost:8000"
+$TracePath = Join-Path $ProjectDir "019e649f-4e27-74db-82da-920f57b13786\grading-workload-spec.json"
+
+function Wait-ForVllmHealth {
+    param([int]$TimeoutSeconds)
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    do {
+        try {
+            $response = Invoke-WebRequest -Uri "$BaseUrl/health" -TimeoutSec 3 -UseBasicParsing
+            if ($response.StatusCode -eq 200) {
+                Write-Host "vLLM health check passed." -ForegroundColor Green
+                return
+            }
+        } catch {
+            # vLLM is still starting; retry until the deadline.
+        }
+        Start-Sleep -Seconds 2
+    } while ((Get-Date) -lt $deadline)
+
+    throw "vLLM did not become healthy within $TimeoutSeconds seconds. See: docker compose -f `"$ComposePath`" logs"
+}
 
 Write-Host "=========================================" -ForegroundColor Cyan
-Write-Host "  Viettel AI Race 2026 — Local Runner"
-Write-Host "  Profile: $Profile"
+Write-Host " Viettel AI Race 2026 - Local Runner" -ForegroundColor Cyan
+Write-Host " Compose: $ComposePath" -ForegroundColor Yellow
 Write-Host "=========================================" -ForegroundColor Cyan
 
 if ($Stop) {
-    Write-Host "Stopping containers..." -ForegroundColor Yellow
-    docker compose -f $composeFile down
-    exit 0
+    docker compose -f $ComposePath down
+    exit $LASTEXITCODE
 }
 
 if ($Benchmark) {
-    Write-Host "Running ERS benchmark..." -ForegroundColor Green
+    if (-not $BenchmarkOutput) {
+        $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+        $BenchmarkOutput = Join-Path $ProjectDir "benchmark\results\local-$stamp.json"
+    }
     conda run -n viettel python "$ProjectDir\benchmark\benchmark_ers.py" `
-        --trace "$ProjectDir\019e649f-4e27-74db-82da-920f57b13786\grading-workload-spec.json" `
-        --request-rate inf
-    exit 0
+        --trace $TracePath `
+        --request-rate inf `
+        --seed 42 `
+        --runs 1 `
+        --output $BenchmarkOutput
+    exit $LASTEXITCODE
 }
 
 if ($TestAccuracy) {
-    Write-Host "Running accuracy test..." -ForegroundColor Green
-    conda run -n viettel python "$ProjectDir\benchmark\test_accuracy.py" --mode quick
+    conda run -n viettel python "$ProjectDir\benchmark\test_accuracy.py" `
+        --base-url $BaseUrl `
+        --mode $AccuracyMode
+    exit $LASTEXITCODE
+}
+
+docker compose -f $ComposePath config --quiet
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}
+
+if ($Detached) {
+    docker compose -f $ComposePath up -d
+    if ($LASTEXITCODE -ne 0) {
+        exit $LASTEXITCODE
+    }
+    Wait-ForVllmHealth -TimeoutSeconds $HealthTimeoutSeconds
+    Write-Host "Server started in the background." -ForegroundColor Green
+    Write-Host "  Benchmark: .\scripts\run_local.ps1 -Benchmark" -ForegroundColor Yellow
+    Write-Host "  Accuracy:  .\scripts\run_local.ps1 -TestAccuracy -AccuracyMode gpqa" -ForegroundColor Yellow
+    Write-Host "  Stop:      .\scripts\run_local.ps1 -Stop" -ForegroundColor Yellow
     exit 0
 }
 
-# Start server
-Write-Host ""
-Write-Host "Starting vLLM server with $Profile profile..." -ForegroundColor Green
-Write-Host "Compose file: $composeFile" -ForegroundColor Yellow
-Write-Host ""
-
-if ($Detached) {
-    docker compose -f $composeFile up -d
-    Write-Host ""
-    Write-Host "Server started in background." -ForegroundColor Green
-    Write-Host "  Health check: curl http://localhost:8000/health" -ForegroundColor Yellow
-    Write-Host "  View logs:    docker compose -f $composeFile logs -f" -ForegroundColor Yellow
-    Write-Host "  Stop:         .\scripts\run_local.ps1 -Profile $Profile -Stop" -ForegroundColor Yellow
-    Write-Host ""
-    Write-Host "  Run benchmark: .\scripts\run_local.ps1 -Benchmark" -ForegroundColor Yellow
-    Write-Host "  Test accuracy: .\scripts\run_local.ps1 -TestAccuracy" -ForegroundColor Yellow
-} else {
-    Write-Host "Press Ctrl+C to stop" -ForegroundColor Yellow
-    Write-Host ""
-    docker compose -f $composeFile up
-}
+Write-Host "Press Ctrl+C to stop." -ForegroundColor Yellow
+docker compose -f $ComposePath up

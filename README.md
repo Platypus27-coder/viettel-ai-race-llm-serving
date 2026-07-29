@@ -1,179 +1,234 @@
-# Viettel AI Race 2026 — LLM Inference Optimization
+# Viettel AI Race 2026 — LLM Serving
 
-Serving and measurement toolkit for
-`LiquidAI/LFM2.5-1.2B-Instruct` on one MiG H200 (18 GB VRAM, three CPU
-cores, eight GB RAM) with vLLM 0.22.1.
+This repository is the reproducible serving workflow for
+`LiquidAI/LFM2.5-1.2B-Instruct` on the contest's one 18 GB MiG H200 slice
+with vLLM `0.22.1`.
 
-The final score is:
+`docker-compose.yml` at the repository root is the **only portal artifact**.
+It is intentionally left on the scored v6 incumbent (61.41). Files generated
+under `artifacts/` are review/preflight inputs; promote one to the root only
+when it is the exact Compose file about to be uploaded.
 
-```text
-Score = 100 × ERS × f(accuracy drop)
-```
+## Current strategy
 
-The repository treats Colab T4 as a functional and accuracy gate. Only portal
-submissions are used as H200 performance measurements.
-
-[Open the validation notebook in Google Colab](https://colab.research.google.com/github/Platypus27-coder/viettel-ai-race-llm-serving/blob/main/notebooks/colab_benchmark.ipynb)
-
-## Project layout
+The online evidence says v6 is the safest incumbent:
 
 ```text
-ViettelAI/
-├── docker-compose.yml          # the single active portal artifact
-├── configs/                    # baseline and all candidate configurations
-├── benchmark/                  # workload, accuracy, reports, result manifest
-├── scripts/                    # run, generate, and record automation
-├── tests/                      # unit and mock-server tests
-├── notebooks/                  # Colab GPU validation workflows
-│   └── colab_benchmark.ipynb
-└── README.md / solution.md     # operating guide and selected strategy
+--max-model-len=8192
+--gpu-memory-utilization=0.97
+--quantization=fp8
+--kv-cache-dtype=fp8_e4m3
+--enable-prefix-caching
 ```
 
-This avoids duplicate active configurations: files under `configs/` are
-references or candidates; only the root `docker-compose.yml` is submitted.
+The first controlled challenger is a custom image that adds vLLM dynamic FP8
+coverage to `ShortConv.in_proj` and `ShortConv.out_proj`. It makes no
+scheduler, attention-backend, CUDA-environment, KV-scale, or model-weight
+change. The patch is intentionally narrow because LFM2 has ten ShortConv
+blocks and only six attention blocks.
 
-## What is implemented
+Do not infer H200 latency from a Colab T4: T4 is used only for server startup,
+the 420-request workload, and accuracy screening. Native FP8 W8A8 throughput
+is a Hopper/Ada capability.
 
-- Faithful 70-conversation × six-turn benchmark (420 requests).
-- Exact tokenizer-based input budgets and real growing assistant history.
-- Deterministic Poisson arrivals with seed 42 and configurable request-rate
-  sweeps.
-- Robust fragmented SSE parsing, exact output-token validation, TTFT/TPOT/ERS,
-  per-turn percentiles, vLLM metrics, and JSON reports.
-- Quick accuracy sanity check plus a full `lm-eval` GPQA runner.
-- Three remaining submission candidates with guarded FP8 weight selection and
-  reproducible result manifests.
-- Colab notebook pinned to `vllm==0.22.1`.
+## Layout
 
-## Local environment
+```text
+docker-compose.yml              active v6 portal artifact
+Dockerfile                      digest-pinned vLLM 0.22.1 custom image
+docker/shortconv-fp8/           fail-closed ShortConv patch and optional draft bake
+configs/                        BTC baseline/reference only
+benchmark/                      faithful workload, comparison, accuracy, manifest
+scripts/                        render, record, build, and local-run helpers
+notebooks/colab_benchmark.ipynb reproducible Colab preflight
+TEAM_REPORT.md                  portal evidence and decision record
+CHANGELOG.md                    controlled experiment history
+```
 
-All local Python commands use the `viettel` Conda environment:
+## Before every portal attempt
+
+Run local Python only through the supplied Conda environment:
 
 ```powershell
 conda run -n viettel python -m pip install -r requirements.txt
 conda run -n viettel python -m unittest discover -s tests -v
 ```
 
-The Windows machine runs clients and tests only. The vLLM server runs in
-Docker/Linux on a GPU or in Colab.
+The Windows workstation is for tests and client tools. Build and serve the
+image on a Linux GPU runner or through the contest-compatible Docker setup.
+The serving process must have the contest-mounted target model at `/model` and
+must not need the network.
 
-## Colab workflow
+For Colab, open
+[the validation notebook](https://colab.research.google.com/github/Platypus27-coder/viettel-ai-race-llm-serving/blob/main/notebooks/colab_benchmark.ipynb).
+It clones this repository and installs the official CUDA 12.9 vLLM wheel. If a
+previous runtime imported a CUDA 13 vLLM build, choose **Runtime → Restart
+session** before rerunning the setup cell.
 
-1. Open the GitHub-hosted notebook using the Colab link above.
-2. Select a T4 runtime.
-3. Run the setup cell; it clones or fast-forwards the repository under
-   `/content/viettel-ai-race-llm-serving` and installs the `cu129` wheel of
-   `vllm==0.22.1`.
-4. Start a clean server and run the 420-request workload.
-5. Run the quick accuracy check and full GPQA for every quantized candidate.
-6. Download the benchmark JSON, GPQA results, and `vllm.log`.
+The preflight gate is:
 
-The default PyPI wheel for vLLM 0.22.1 requires CUDA 13 and fails on the Colab
-T4 runtime with `libcudart.so.13` missing. The notebook therefore installs from
-`https://wheels.vllm.ai/0.22.1/cu129` using `uv --torch-backend=cu129` and
-verifies `vllm._C` in a subprocess before downloading the model. If a broken
-CUDA 13 installation has already been imported, restart the Colab session and
-rerun from the setup cell.
+- `/health` succeeds after a fresh server start;
+- all 420 workload requests succeed with exactly 300 output tokens;
+- startup log records the resolved `max_num_batched_tokens`, `max_num_seqs`,
+  chunked-prefill state, and Mamba cache mode;
+- full GPQA Diamond is retained for v6 and for each quantized candidate; and
+- the result directory contains the benchmark JSON, GPQA JSON, startup log,
+  resolved configuration, Compose SHA-256, and image digest.
 
-This compatibility choice applies only to Colab. Portal submissions continue
-to use the official `vllm/vllm-openai:v0.22.1` image on H200.
+## Controlled candidates
 
-Do not compare T4 latency between BF16/FP16 and FP8 to select the H200
-submission. T4 does not execute the same native W8A8 path as Hopper.
+Render candidates from the v6 root rather than maintaining a second active
+submission directory. `--custom-image` must be a pushed immutable image
+reference, not a tag.
 
-## Faithful ERS benchmark
+```powershell
+# Candidate 1 — ShortConv FP8 only.
+conda run -n viettel python scripts/select_submission.py `
+  --candidate shortconv-fp8 `
+  --custom-image 'DOCKERHUB_USER/viettel-ai-vllm:shortconv-fp8@sha256:<64-hex>' `
+  --output artifacts/shortconv-fp8.yml
 
-Run one cold-cache rate:
+# Candidate 2 — only after the baked-draft image passes preflight.
+conda run -n viettel python scripts/select_submission.py `
+  --candidate speculative-draft `
+  --custom-image 'DOCKERHUB_USER/viettel-ai-vllm:shortconv-fp8-draft350@sha256:<64-hex>' `
+  --output artifacts/speculative-draft.yml
+
+# Candidate 3 or fallback for candidate 2 — decode-oriented scheduler A/B.
+conda run -n viettel python scripts/select_submission.py `
+  --candidate batch1536 --output artifacts/batch1536.yml
+
+# Candidate 4, only if another attempt remains.
+conda run -n viettel python scripts/select_submission.py `
+  --candidate batch1024 --output artifacts/batch1024.yml
+```
+
+Validate the rendered file before building/uploading it:
+
+```powershell
+docker compose -f artifacts/shortconv-fp8.yml config --quiet
+```
+
+To deliberately make a reviewed candidate the root portal artifact, render it
+directly to the root with the explicit guard:
+
+```powershell
+conda run -n viettel python scripts/select_submission.py `
+  --candidate shortconv-fp8 `
+  --custom-image 'DOCKERHUB_USER/viettel-ai-vllm:shortconv-fp8@sha256:<64-hex>' `
+  --output docker-compose.yml --promote
+```
+
+The experiment order is ShortConv-FP8, then speculative draft only if it
+passes preflight, then the winning parent plus batch 1536, then batch 1024 if
+an attempt remains. Do not combine those changes. In particular, leave
+`max-num-seqs`, block size, async scheduling, attention backend,
+`CUDA_DEVICE_MAX_CONNECTIONS`, and `--calculate-kv-scales` alone.
+
+The speculative candidate requires a second image built with the draft baked
+at `/opt/draft/LFM2.5-350M`; it uses exactly four draft tokens, draft TP 1,
+and the existing 8192 target context. Its greedy output must be compared with
+the non-speculative image before it reaches the portal.
+
+Capture the parent before restarting the server, then compare after the draft
+server reaches `/health`:
+
+```powershell
+conda run -n viettel python benchmark/compare_greedy.py `
+  --base-url http://localhost:8000 `
+  --output artifacts/shortconv-fp8/greedy-parent.json
+
+# Restart with the speculative Compose/image, then:
+conda run -n viettel python benchmark/compare_greedy.py `
+  --base-url http://localhost:8000 `
+  --expected artifacts/shortconv-fp8/greedy-parent.json `
+  --output artifacts/speculative-draft/greedy-compare.json
+```
+
+## Building the custom images
+
+The `Dockerfile` pins the official vLLM `v0.22.1` base by digest and aborts if
+the expected source anchors differ. A standard build contains just the
+ShortConv FP8 patch:
+
+```powershell
+docker build -t DOCKERHUB_USER/viettel-ai-vllm:shortconv-fp8 .
+```
+
+Or use the helper, which never edits `docker-compose.yml` and prints the
+immutable registry reference after a successful push:
+
+```powershell
+.\scripts\build_and_push.ps1 -DockerHubUsername DOCKERHUB_USER `
+  -Variant shortconv-fp8
+```
+
+The speculative variant is opt-in and downloads the immutable draft revision
+at build time only. The runtime has `HF_HUB_OFFLINE=1` and
+`TRANSFORMERS_OFFLINE=1`.
+
+```powershell
+docker build --build-arg BAKE_DRAFT_MODEL=1 `
+  -t DOCKERHUB_USER/viettel-ai-vllm:shortconv-fp8-draft350 .
+```
+
+```powershell
+.\scripts\build_and_push.ps1 -DockerHubUsername DOCKERHUB_USER `
+  -Variant shortconv-fp8-draft350m
+```
+
+After push, obtain the registry digest and use the full `image@sha256:...`
+reference in `select_submission.py`. Never submit a mutable tag.
+
+## Measure and record evidence
+
+Run one workload against a healthy server:
 
 ```powershell
 conda run -n viettel python benchmark/benchmark_ers.py `
   --trace 019e649f-4e27-74db-82da-920f57b13786/grading-workload-spec.json `
-  --tokenizer-path /model `
-  --request-rate inf `
-  --seed 42 `
-  --runs 1 `
-  --output benchmark/results/ers-inf.json
+  --tokenizer-path /model --request-rate inf --seed 42 --runs 1 `
+  --output artifacts/shortconv-fp8/benchmark.json
 ```
 
-Run the rate sweep:
+Run full GPQA only on the GPU runner/Colab:
 
 ```powershell
-conda run -n viettel python benchmark/benchmark_ers.py `
-  --trace 019e649f-4e27-74db-82da-920f57b13786/grading-workload-spec.json `
-  --tokenizer-path /model `
-  --sweep-request-rates 0.5,1,2,4,8,inf `
-  --output benchmark/results/rate-sweep.json
+conda run -n viettel python benchmark/test_accuracy.py `
+  --base-url http://localhost:8000 --mode gpqa --task gpqa_diamond `
+  --output artifacts/shortconv-fp8/gpqa
 ```
 
-Between sweep runs, the client requires vLLM's prefix-cache reset endpoint.
-If the endpoint is unavailable, restart the server and run each rate
-separately; the benchmark stops instead of reporting warm-cache-biased data.
-
-## Accuracy
-
-Quick sanity test:
+Record the portal result and hashes in the tracked manifest (all artifact paths
+are hashed; generated artifact content remains ignored):
 
 ```powershell
-conda run -n viettel python benchmark/test_accuracy.py --mode quick
+conda run -n viettel python scripts/record_submission.py `
+  --candidate shortconv-fp8 --submission-id '<portal-id>' `
+  --compose artifacts/shortconv-fp8.yml `
+  --metrics artifacts/shortconv-fp8/benchmark.json `
+  --gpqa artifacts/shortconv-fp8/gpqa/results.json `
+  --startup-log artifacts/shortconv-fp8/vllm.log `
+  --resolved-vllm-config artifacts/shortconv-fp8/runtime.json `
+  --healthcheck-passed --preflight-successful-requests 420 `
+  --ers <portal-ers> --accuracy <gpqa-accuracy> --f-delta 1.0 --portal-valid
 ```
 
-Full GPQA gate on Colab:
+`benchmark/submission_results.json` is the tracked decision manifest. It only
+recommends a non-v6 candidate when it has a full preflight, passes accuracy,
+and strictly improves v6's portal ERS. If ERS values are within 0.01, use
+higher accuracy and then lower p95 TTFT as tie-breakers.
 
-```bash
-python benchmark/test_accuracy.py \
-  --mode gpqa \
-  --task gpqa_diamond \
-  --concurrency 4 \
-  --output benchmark/gpqa_results
-```
+For `speculative-draft`, also pass
+`--greedy-comparison artifacts/speculative-draft/greedy-compare.json`; the
+manifest rejects it unless the recorded comparison says every greedy response
+matched the non-speculative parent.
 
-The selection floor is 0.32 and the preferred safety margin is 0.35. Confirm
-the exact GPQA task alias used by the competition's `lm-eval` version.
+## Constraints
 
-## Remaining portal submissions
-
-`docker-compose.yml` is the active portal artifact. Reference and candidate
-configurations live together under `configs/`:
-
-- `configs/docker-compose.baseline.yml`: BTC reference.
-- `configs/docker-compose.observed-48.2-bf16-batch8192-seqs80.yml`: archived 48.2-point
-  batch8192/seqs80 configuration.
-- `configs/docker-compose.slot-03-bf16-batch4096-seqs64.yml`: run 3 recovery
-  candidate and current root artifact.
-- `configs/docker-compose.slot-04-bf16-batch2048-seqs64.yml`: run 4 TBT
-  candidate.
-
-Generate the fixed recovery candidates:
-
-```powershell
-conda run -n viettel python scripts/select_submission.py `
-  --slot 3 --output configs/generated-03.yml
-
-conda run -n viettel python scripts/select_submission.py `
-  --slot 4 --output configs/generated-04.yml
-```
-
-Run 5 uses FP8 weights with the winning batch only after GPQA is at least 0.32
-and the workload completes 420/420. Otherwise it uses BF16 with the winning
-batch and 48 sequences. FP8 KV and batch 16384 are excluded. See
-`configs/README.md` for exact commands and manifest recording. Validate every
-generated file before upload:
-
-```powershell
-docker compose -f configs/generated-03.yml config --quiet
-```
-
-The 60.02-point historical run remains the incumbent. If normalized ERS differs
-by less than 0.01, choose higher accuracy; if accuracy ties, choose lower p95
-TTFT.
-
-## Important constraints
-
-- Required entrypoint:
-  `python3 -m vllm.entrypoints.openai.api_server`
-- Required endpoint: `0.0.0.0:8000`
-- Required served model name: `LFM2.5-1.2B-Instruct`
-- No pre-baked cache, hardcoded output, dual path, external service, or
-  benchmark-specific response behavior.
-- Never submit a configuration with an OOM, timeout, zero-token response, or
-  fewer than 420 successful requests.
+- Keep the required entrypoint, served model name, `/model`, and port 8000.
+- Do not pre-bake a prefix cache, hard-code outputs, add an external service,
+  or make the serving process download model assets.
+- A candidate with an OOM, timeout, zero-token response, or fewer than 420
+  successful requests is not eligible for portal selection.
+- Preserve v6 when the new candidate does not clearly beat it on the portal.

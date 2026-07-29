@@ -1,9 +1,16 @@
 {
+  "schema_version": 2,
   "selection_policy": {
     "minimum_accuracy": 0.32,
     "preferred_accuracy": 0.35,
     "ers_tie_threshold": 0.01,
-    "ers_scale": "accepts 0..1 or portal points 0..100",
+    "replacement_requires": [
+      "portal_valid",
+      "accuracy_gate",
+      "healthcheck",
+      "420_of_420_preflight",
+      "strict_portal_ers_gain_over_v6"
+    ],
     "tie_breakers": [
       "higher_accuracy",
       "lower_p95_ttft_ms"
@@ -11,10 +18,29 @@
   },
   "submissions": [
     {
-      "slot": 1,
-      "submission_id": null,
-      "compose_file": "configs/docker-compose.slot-03-bf16-batch4096-seqs64.yml",
-      "compose_sha256": null,
+      "candidate": "shortconv-fp8",
+      "submission_id": "<portal-submission-id>",
+      "compose_file": "artifacts/shortconv-fp8.yml",
+      "compose_sha256": "<sha256>",
+      "image_reference": "DOCKERHUB_USER/viettel-ai-vllm:shortconv-fp8@sha256:<64-hex>",
+      "image_digest": "sha256:<64-hex>",
+      "resolved_vllm_config": {
+        "path": "artifacts/shortconv-fp8/runtime.json",
+        "sha256": "<sha256>"
+      },
+      "metrics": {
+        "path": "artifacts/shortconv-fp8/benchmark.json",
+        "sha256": "<sha256>"
+      },
+      "gpqa": {
+        "path": "artifacts/shortconv-fp8/gpqa/results.json",
+        "sha256": "<sha256>"
+      },
+      "greedy_comparison": null,
+      "startup_log": {
+        "path": "artifacts/shortconv-fp8/vllm.log",
+        "sha256": "<sha256>"
+      },
       "ers": null,
       "ers_normalized": null,
       "accuracy": null,
@@ -28,10 +54,13 @@
       "tbt_median_ms": null,
       "successful_requests": null,
       "failed_requests": null,
-      "warmup_count": null,
+      "healthcheck_passed": true,
+      "preflight_successful_requests": 420,
+      "preflight_expected_requests": 420,
       "portal_valid": null,
-      "status": null,
-      "notes": "BF16 recovery candidate: batch4096/seqs64"
+      "status": "preflight_complete",
+      "notes": "Replace every placeholder with evidence from the exact candidate."
     }
-  ]
+  ],
+  "recommended_candidate": "v6-incumbent"
 }

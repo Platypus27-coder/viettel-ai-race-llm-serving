@@ -1,46 +1,50 @@
-# ============================================================
-# Viettel AI Race 2026 — LLM Inference Optimization
-# Custom Docker Image based on vLLM v0.22.1
-# Model: LiquidAI/LFM2.5-1.2B-Instruct
-# GPU: 1x MiG H200 18GB VRAM
-# ============================================================
+# syntax=docker/dockerfile:1
+#
+# Custom vLLM image for the Viettel AI Race.
+#
+# The linux/amd64 digest below is the manifest for
+# vllm/vllm-openai:v0.22.1. Pinning it makes the vLLM implementation being
+# patched deterministic; do not replace it with a floating tag.
+FROM vllm/vllm-openai:v0.22.1@sha256:55c9bcee9fc66644b139fddae8a7a03e4c0c8a25ab5c64b0ce614554a8abf5d5
 
-FROM vllm/vllm-openai:v0.22.1
+ARG BAKE_DRAFT_MODEL=0
+ARG DRAFT_MODEL_ID=LiquidAI/LFM2.5-350M
+# Immutable checkpoint revision verified against all required files on
+# 2026-07-29. Override only with another immutable commit SHA.
+ARG DRAFT_MODEL_REVISION=1575d1b8b67d862834836087765bff2ef4020672
 
-# ---- System-level optimizations ----
-# Reduce Python startup overhead
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
+COPY docker/shortconv-fp8/patch_vllm_shortconv_fp8.py /opt/vllm-patches/
+COPY docker/shortconv-fp8/bake_draft_model.py /opt/vllm-patches/
 
-# PyTorch memory allocator optimization
-ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# Refuse to patch a different vLLM release and fail the build if the expected
+# source anchors drift. The patch only quantizes ShortConv's two GEMM
+# projections; conv1d remains untouched.
+RUN python3 -B /opt/vllm-patches/patch_vllm_shortconv_fp8.py --apply --verify
 
-# CUDA optimizations
-ENV CUDA_VISIBLE_DEVICES=0
-ENV CUDA_DEVICE_ORDER=PCI_BUS_ID
+# The default path does not download a second model. Supplying
+# --build-arg BAKE_DRAFT_MODEL=1 downloads the pinned draft checkpoint into
+# /opt/draft/LFM2.5-350M at build time, so serving can remain fully offline.
+RUN BAKE_DRAFT_MODEL="${BAKE_DRAFT_MODEL}" \
+    DRAFT_MODEL_ID="${DRAFT_MODEL_ID}" \
+    DRAFT_MODEL_REVISION="${DRAFT_MODEL_REVISION}" \
+    HF_HUB_OFFLINE=0 \
+    TRANSFORMERS_OFFLINE=0 \
+    HF_HOME=/tmp/hf-download \
+    python3 -B /opt/vllm-patches/bake_draft_model.py \
+    && rm -rf /tmp/hf-download
 
-# vLLM performance tuning via environment variables
-# Use FlashInfer attention backend if available (faster decode)
-# Falls back gracefully if not supported for this model
-ENV VLLM_ATTENTION_BACKEND=FLASH_ATTN
+# The contest mounts the target model at /model. These guards ensure the
+# runtime never falls back to downloading model assets or telemetry.
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    VLLM_NO_USAGE_STATS=1 \
+    DO_NOT_TRACK=1 \
+    VLLM_LOGGING_LEVEL=WARNING
 
-# Disable usage stats to reduce startup overhead
-ENV VLLM_NO_USAGE_STATS=1
-ENV DO_NOT_TRACK=1
-
-# Reduce logging overhead during serving
-ENV VLLM_LOGGING_LEVEL=WARNING
-
-# ---- Optional: Pre-download model into image ----
-# Uncomment these lines if you want to bake model weights into the image
-# (faster cold start, but larger image ~2.5GB+)
-# RUN pip install huggingface-hub && \
-#     huggingface-cli download LiquidAI/LFM2.5-1.2B-Instruct \
-#       --local-dir /model \
-#       --local-dir-use-symlinks False
-
-# ---- Health check ----
 HEALTHCHECK --interval=5s --timeout=3s --start-period=60s --retries=3 \
-  CMD curl -f http://localhost:8000/health || exit 1
+  CMD curl -fsS http://localhost:8000/health || exit 1
 
 EXPOSE 8000

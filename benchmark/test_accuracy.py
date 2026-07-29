@@ -1,7 +1,7 @@
 """
 Viettel AI Race 2026 — Accuracy Validation Script
 ===================================================
-Validates that the submission maintains accuracy >= 0.30 on GPQA Diamond
+Validates that a candidate is healthy before the full GPQA Diamond gate.
 before submitting to the competition.
 
 Usage:
@@ -15,20 +15,21 @@ Usage:
     #     --batch_size auto
 """
 
+import argparse
 import asyncio
 import json
-import sys
-import time
-import argparse
 import os
+import re
 import subprocess
+import sys
 from pathlib import Path
 
 import aiohttp
 
 MODEL_NAME = "LFM2.5-1.2B-Instruct"
 ACCURACY_BASELINE = 0.40
-ACCURACY_SAFE = 0.30     # Δ ≤ 0.10 → f(Δ) = 1.0
+MINIMUM_GPQA_ACCURACY = 0.32
+PREFERRED_GPQA_ACCURACY = 0.35
 ACCURACY_ZERO = 0.24     # Δ ≥ 0.16 → f(Δ) = 0.0
 
 # GPQA Diamond-style questions for quick validation
@@ -137,6 +138,12 @@ VALIDATION_QUESTIONS = [
 ]
 
 
+def extract_choice(content: str) -> str:
+    """Extract a standalone multiple-choice answer without matching ``Answer``."""
+    match = re.search(r"(?<![A-Z])([A-D])(?![A-Z])", content.upper())
+    return match.group(1) if match else ""
+
+
 async def ask_question(
     session: aiohttp.ClientSession,
     base_url: str,
@@ -172,12 +179,7 @@ async def ask_question(
             data = await resp.json()
             content = data["choices"][0]["message"]["content"].strip()
 
-            # Extract the letter answer
-            predicted = ""
-            for char in content.upper():
-                if char in "ABCD":
-                    predicted = char
-                    break
+            predicted = extract_choice(content)
 
             correct = predicted == question["answer"]
             return predicted, correct
@@ -185,7 +187,7 @@ async def ask_question(
         return f"ERROR: {e}", False
 
 
-async def run_accuracy_test(base_url: str):
+async def run_accuracy_test(base_url: str, output: str | None = None) -> int:
     """Run quick accuracy validation."""
     print(f"\n{'='*60}")
     print(f"  Viettel AI Race 2026 — Accuracy Validation")
@@ -208,7 +210,7 @@ async def run_accuracy_test(base_url: str):
                 pass
             if attempt == 14:
                 print("  ❌ Server not responding")
-                return
+                return 2
             await asyncio.sleep(2)
 
     # Run questions
@@ -245,13 +247,43 @@ async def run_accuracy_test(base_url: str):
 
     print(f"  f(Δ): {f_delta:.3f}")
 
-    if accuracy >= ACCURACY_SAFE:
-        print(f"\n  ✅ SAFE — Accuracy >= {ACCURACY_SAFE:.0%}, no penalty expected")
+    if accuracy >= PREFERRED_GPQA_ACCURACY:
+        print(
+            f"\n  ✅ PREFERRED SCREEN — quick accuracy >= "
+            f"{PREFERRED_GPQA_ACCURACY:.0%}"
+        )
+    elif accuracy >= MINIMUM_GPQA_ACCURACY:
+        print(
+            f"\n  ⚠️  MINIMUM SCREEN — quick accuracy >= "
+            f"{MINIMUM_GPQA_ACCURACY:.0%}; full GPQA is still required"
+        )
     elif accuracy >= ACCURACY_ZERO:
-        print(f"\n  ⚠️  WARNING — Accuracy between {ACCURACY_ZERO:.0%} and {ACCURACY_SAFE:.0%}")
+        print(
+            f"\n  ⚠️  WARNING — quick accuracy between {ACCURACY_ZERO:.0%} "
+            f"and {MINIMUM_GPQA_ACCURACY:.0%}"
+        )
         print(f"  Score will be reduced by f(Δ) = {f_delta:.3f}")
     else:
         print(f"\n  ❌ DANGER — Accuracy <= {ACCURACY_ZERO:.0%}, score will be ZERO!")
+
+    result = {
+        "mode": "quick",
+        "model": MODEL_NAME,
+        "questions": total,
+        "correct": correct_count,
+        "accuracy": accuracy,
+        "accuracy_baseline": ACCURACY_BASELINE,
+        "accuracy_drop": delta,
+        "f_delta_estimate": f_delta,
+        "minimum_gpqa_accuracy": MINIMUM_GPQA_ACCURACY,
+        "preferred_gpqa_accuracy": PREFERRED_GPQA_ACCURACY,
+        "note": "Quick questions are a smoke test and are not GPQA Diamond.",
+    }
+    if output:
+        output_path = Path(output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+        print(f"  Quick result JSON: {output_path}")
 
     print(f"\n  ⚠️  NOTE: This is a quick sanity check, NOT the official GPQA Diamond.")
     print(f"  For official accuracy, run:")
@@ -259,6 +291,7 @@ async def run_accuracy_test(base_url: str):
     print(f"      --model_args model={MODEL_NAME},base_url={base_url}/v1 \\")
     print(f"      --tasks gpqa_diamond --batch_size auto")
     print()
+    return 0
 
 
 def run_gpqa_full(
@@ -336,6 +369,10 @@ def main():
         "--output",
         default=str(Path(__file__).with_name("gpqa_results")),
     )
+    parser.add_argument(
+        "--quick-output",
+        help="Optional JSON artifact for --mode quick.",
+    )
     parser.add_argument("--limit", type=int)
     parser.add_argument("--concurrency", type=int, default=4)
     args = parser.parse_args()
@@ -348,8 +385,7 @@ def main():
             args.limit,
             args.concurrency,
         )
-    asyncio.run(run_accuracy_test(args.base_url))
-    return 0
+    return asyncio.run(run_accuracy_test(args.base_url, args.quick_output))
 
 
 if __name__ == "__main__":

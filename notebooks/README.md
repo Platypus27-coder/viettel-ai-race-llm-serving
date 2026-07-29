@@ -1,19 +1,65 @@
-# Notebooks
+# Colab notebooks
 
-This directory contains interactive GPU validation workflows, not submission
-artifacts. The notebook calls the benchmark and accuracy tools from the
-repository instead of maintaining duplicate implementations.
+`colab_benchmark.ipynb` is the repository's Colab validation workflow. It
+clones `Platypus27-coder/viettel-ai-race-llm-serving` into `/content`, so no
+project folder needs to be uploaded manually.
 
-- `colab_benchmark.ipynb`: Colab T4 functional, stability, workload, and
-  accuracy validation for the remaining submission process. It clones
-  `Platypus27-coder/viettel-ai-race-llm-serving` into the Colab runtime, so no
-  folder upload is required. Its setup cell replaces the incompatible default
-  CUDA 13 package with the official vLLM 0.22.1 CUDA 12.9 wheel and verifies
-  the compiled extension before model download.
+[Open the notebook in Colab](https://colab.research.google.com/github/Platypus27-coder/viettel-ai-race-llm-serving/blob/main/notebooks/colab_benchmark.ipynb)
 
-[Open `colab_benchmark.ipynb` in Colab](https://colab.research.google.com/github/Platypus27-coder/viettel-ai-race-llm-serving/blob/main/notebooks/colab_benchmark.ipynb)
+Use a Tesla T4 runtime. Colab validates installation, server health, workload
+stability, and accuracy only; its TTFT, TPOT, and ERS are not H200 performance
+measurements and must not select a portal submission.
 
-T4 latency results must not be used to predict H200 FP8 performance.
+## Clean CUDA setup
 
-If the runtime has already loaded the CUDA 13 build, select **Runtime → Restart
-session** and rerun the notebook from the setup cell.
+The first code cell:
+
+- clones/fetches the configured repository ref and records its resolved SHA;
+- removes the old CUDA-13 vLLM/Torch packages and only the obsolete
+  `libcudart.so.13` symlink left by the previous notebook;
+- installs `vllm==0.22.1` from the official CUDA 12.9 wheel index using `uv`;
+- uses a fresh subprocess to require `vllm._C`, CUDA 12.x, and a Tesla T4
+  before downloading model weights;
+- writes the Python package list, GPU details, environment JSON, and install
+  diagnostics to a timestamped artifact directory.
+
+If the current session has already imported `torch` or `vllm`, choose
+**Runtime → Restart session** and run the notebook from the top. Do not create
+or retain a CUDA-13 symlink as a workaround.
+
+## Profiles
+
+The server cell always keeps the v6 common settings
+`--max-model-len=8192`, `--gpu-memory-utilization=0.97`, and
+`--enable-prefix-caching`.
+
+- `t4-fp16` is the default. It adds `--dtype=float16` and is the profile for
+  the 420-request workload and GPQA tooling.
+- `v6-fp8-smoke` adds the exact portal v6 flags `--quantization=fp8` and
+  `--kv-cache-dtype=fp8_e4m3`. Set
+  `os.environ['VIETTEL_COLAB_PROFILE'] = 'v6-fp8-smoke'` before the server
+  cell to try it. A T4 has no native Hopper FP8 W8A8 path, so this is only an
+  optional start/function/accuracy smoke test; a rejection is recorded in its
+  server log and is not a portal failure.
+- `shortconv-fp8-smoke` first applies the repository's fail-closed ShortConv
+  patch to the installed vLLM source, then uses the same FP8 flags. Run the
+  unpatched `t4-fp16` baseline first: the source patch persists for the rest
+  of the Colab session, so restart from setup before returning to unpatched
+  v6.
+
+Each server-cell execution terminates the prior process, starts a clean
+server without prefix prewarming, validates `/health` and `/v1/models`, and
+captures the resolved scheduler/chunked-prefill/Mamba settings from the vLLM
+startup log.
+
+## Artifacts
+
+The notebook calls `benchmark/benchmark_ers.py` and
+`benchmark/test_accuracy.py` from the cloned repository. It stores server
+configuration, startup log, health result, raw `/metrics`, the 420-request
+JSON result, quick-accuracy log and JSON, optional full GPQA output, and a manifest in
+`/content/viettel-artifacts/`, then downloads a zip.
+
+Full GPQA is deliberately opt-in: set `RUN_FULL_GPQA = True` in the final
+cell after the workload succeeds. The downloaded zip is the record to attach
+to a portal submission manifest; it does not replace H200 portal measurements.

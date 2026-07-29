@@ -1,0 +1,54 @@
+{
+  "schema_version": 2,
+  "selection_policy": {
+    "minimum_accuracy": 0.32,
+    "preferred_accuracy": 0.35,
+    "ers_tie_threshold": 0.01,
+    "replacement_requires": [
+      "portal_valid",
+      "accuracy_gate",
+      "healthcheck",
+      "420_of_420_preflight",
+      "strict_portal_ers_gain_over_v6"
+    ],
+    "tie_breakers": [
+      "higher_accuracy",
+      "lower_p95_ttft_ms"
+    ]
+  },
+  "submissions": [
+    {
+      "candidate": "v6-incumbent",
+      "submission_id": null,
+      "compose_file": "docker-compose.yml",
+      "compose_sha256": "2a9b7c682ff3829630b9938a76f21ec43e88e0e8f4ec0122ee135b0d19f5e348",
+      "image_reference": "vllm/vllm-openai:v0.22.1",
+      "image_digest": null,
+      "resolved_vllm_config": null,
+      "metrics": null,
+      "gpqa": null,
+      "greedy_comparison": null,
+      "startup_log": null,
+      "ers": 61.41,
+      "ers_normalized": 0.6141,
+      "accuracy": null,
+      "accuracy_drop": 0.0,
+      "f_delta": 1.0,
+      "penalty": 1.0,
+      "final_score": 61.41,
+      "p50_ttft_ms": 45.0,
+      "p95_ttft_ms": 69.0,
+      "p95_tpot_ms": null,
+      "tbt_median_ms": 4.0,
+      "successful_requests": 415,
+      "failed_requests": 5,
+      "healthcheck_passed": null,
+      "preflight_successful_requests": null,
+      "preflight_expected_requests": 420,
+      "portal_valid": true,
+      "status": "historical_incumbent",
+      "notes": "Historical portal result. The old workspace did not retain the exact portal submission ID, startup log, GPQA JSON, or raw H200 metrics; do not treat the current root Compose hash as the historical uploaded hash."
+    }
+  ],
+  "recommended_candidate": "v6-incumbent"
+}
