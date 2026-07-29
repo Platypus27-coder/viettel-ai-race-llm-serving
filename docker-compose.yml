@@ -5,39 +5,14 @@
 # GPU: 1x MiG H200 (18GB VRAM, 3 CPU cores, 8GB RAM)
 # Framework: vLLM v0.22.1
 #
-# PROFILE: v8.0 — Multi-Step Scheduling Attack on TPOT
+# PROFILE: v8.1 — Validated Supported CLI Optimization Flags
 #
-# Score History:
-#   S02:  60.02  — Baseline BF16
-#   v5.0: 61.15  — FP8 Weights
-#   v6.0: 61.41  — FP8 Weights + FP8 KV Cache E4M3
-#   v7.0: (not submitted)
-#   v8.0: Target 70-80 — Multi-Step Scheduling
-#
-# ROOT CAUSE ANALYSIS (v6.0 = 61.41):
-# ====================================
-# s_ttft (TTFT=45ms): ((400-45)/390)² = 0.86  → OK, near ceiling
-# s_tpot (TPOT=4ms):  ((10-4)/9)²    = 0.44  → THIS IS THE PROBLEM
-#
-# WHY TPOT = 4ms (despite FP8 everything):
-#   LFM2.5 = 10 Conv layers + 6 Attention layers (hybrid)
-#   FP8 KV cache only helps 6/16 attention layers
-#   10/16 Conv layers still run BF16 state reads
-#   Real bottleneck: CPU↔GPU scheduling overhead per decode step
-#   Each step: GPU computes ~2ms + scheduler overhead ~1.5ms = 4ms total
-#
-# FIX: --num-scheduler-steps=10
-#   Instead of: GPU 2ms → CPU 1.5ms → GPU 2ms → CPU 1.5ms (TPOT=3.5ms)
-#   Now:        GPU 2ms×10 → CPU 1.5ms (amortized TPOT=2.15ms)
-#   Expected s_tpot at 2.2ms: ((10-2.2)/9)² = 0.867² = 0.751
-#   Expected ERS: 0.5×0.86 + 0.5×0.75 = 0.805 → ~75-80 points
-#
-# OTHER CHANGES:
-#   --max-model-len=5120: Workload peak = 4700 tokens. Freeing 3072 tokens
-#     of unused KV cache space = ~60MB more for active sequences.
-#   --max-num-seqs=48: Workload has 70 convs but sequential turns mean
-#     only ~20-35 active at once. Cap at 48 prevents memory-bandwidth
-#     saturation while allowing all active requests to proceed.
+# Fixes: Removed --num-scheduler-steps (unsupported by CLI entrypoint).
+# Added BTC-supported flags:
+# 1. --async-scheduling: Asynchronous scheduling loop to reduce CPU overhead.
+# 2. --performance-mode=interactivity: Optimizes scheduler for lowest TPOT/TTFT.
+# 3. --max-model-len=5120: Fits peak workload (4700), frees VRAM.
+# 4. --max-num-seqs=48: Caps concurrent decode to prevent memory bandwidth saturation.
 # ============================================================
 
 services:
@@ -57,20 +32,14 @@ services:
       - --port=8000
       - --tensor-parallel-size=1
 
-      # ---- Memory ----
-      # Workload peak = 4700 tokens. 5120 gives 420 tokens safety margin.
-      # Frees ~60MB VRAM vs 8192 for more concurrent KV cache slots.
+      # ---- Memory & Performance ----
       - --max-model-len=5120
       - --gpu-memory-utilization=0.97
-
-      # ---- Scheduling (THE KEY CHANGE) ----
-      # Multi-step: runs 10 decode steps per scheduler call.
-      # Amortizes ~1.5ms CPU scheduler overhead across 10 steps.
-      # Expected TPOT reduction: 4ms → ~2.2ms
-      - --num-scheduler-steps=10
-      # Cap concurrent sequences to prevent bandwidth saturation.
-      # 70 convs × sequential turns = ~20-35 active. 48 gives headroom.
       - --max-num-seqs=48
+
+      # ---- Scheduling & Interactivity (Supported CLI flags) ----
+      - --async-scheduling
+      - --performance-mode=interactivity
 
       # ---- Quantization ----
       - --quantization=fp8
