@@ -3,7 +3,6 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -50,10 +49,104 @@ def benchmark_summary(
         "expected_requests": 420,
         "successful_requests": 420,
         "failed_requests": 0,
+        "workload_evidence": {
+            "trace_sha256": RECORDER.CANONICAL_WORKLOAD_TRACE_SHA256,
+            "raw_run_count": 1,
+            "request_count": 420,
+            "successful_request_count": 420,
+            "output_tokens_per_request": 300,
+            "request_coordinates_sha256": "c" * 64,
+            "raw_request_records_sha256": "e" * 64,
+        },
     }
     if speculative_decoding is not None:
         summary["speculative_decoding"] = speculative_decoding
     return summary
+
+
+def raw_benchmark_report(
+    speculative_decoding: dict[str, object] | None = None,
+) -> dict[str, object]:
+    requests = [
+        {
+            "conversation_id": conversation_id,
+            "turn": turn,
+            "input_tokens": 2000,
+            "output_tokens": 300,
+            "ttft_ms": 40.0,
+            "tpot_ms": 3.0,
+            "total_time_seconds": 1.0,
+            "s_ttft": 1.0,
+            "s_tpot": 1.0,
+            "s_request": 1.0,
+            "success": True,
+            "error": None,
+        }
+        for conversation_id in range(70)
+        for turn in range(1, 7)
+    ]
+    run: dict[str, object] = {
+        "expected_requests": 420,
+        "observed_requests": 420,
+        "successful_requests": 420,
+        "failed_requests": 0,
+        "success_rate": 1.0,
+        "trace": {
+            **RECORDER.CANONICAL_WORKLOAD_TRACE,
+            "arrival": dict(RECORDER.CANONICAL_WORKLOAD_ARRIVAL),
+        },
+        "failures": [],
+        "requests": requests,
+    }
+    if speculative_decoding is not None:
+        run["speculative_decoding"] = speculative_decoding
+    return {"runs": [run]}
+
+
+def raw_workload_evidence_artifact(
+    report: dict[str, object], metrics_sha256: str
+) -> dict[str, object]:
+    run = report["runs"][0]
+    requests = run["requests"]
+    return {
+        "schema_version": 1,
+        "required": True,
+        "passed": True,
+        "errors": [],
+        "raw_benchmark_sha256": metrics_sha256,
+        "workload": {
+            "expected_requests": 420,
+            "seed": 42,
+            "request_rate": "inf",
+            "output_tokens": 300,
+            "trace_sha256": RECORDER.CANONICAL_WORKLOAD_TRACE_SHA256,
+        },
+        "expected_requests": 420,
+        "observed_requests": 420,
+        "successful_requests": 420,
+        "failed_requests": 0,
+        "request_records_sha256": RECORDER._canonical_workload_evidence(
+            report, "speculative-draft-batch1536"
+        )["raw_request_records_sha256"],
+        "per_request_completion_evidence": [
+            {
+                "conversation_id": request["conversation_id"],
+                "turn": request["turn"],
+                "success": request["success"],
+                "output_tokens": request["output_tokens"],
+            }
+            for request in requests
+        ],
+    }
+
+
+def source_equivalent_command_artifact() -> dict[str, object]:
+    return {
+        "captured_before_server_start": True,
+        "source_equivalent_preflight": True,
+        "offline_serving": dict(RECORDER.OFFLINE_SERVING_ENV),
+        "command": ["python", "-m", "vllm.entrypoints.openai.api_server"],
+    }
 
 
 def measured_speculative_evidence(mean_acceptance_length: float = 3.6) -> dict[str, object]:
@@ -101,6 +194,7 @@ def challenger(
                 "summary": {
                     "repository_commit": "b" * 40,
                     "profile": "speculative-draft-v6-fp8-smoke",
+                    "offline_serving": dict(RECORDER.OFFLINE_SERVING_ENV),
                     "portal_candidate": {
                         "candidate": candidate,
                         "image_reference": record["image_reference"],
@@ -113,7 +207,11 @@ def challenger(
                         "seed": 42,
                         "request_rate": "inf",
                         "output_tokens": 300,
-                        "trace_sha256": "c" * 64,
+                        "trace_sha256": RECORDER.CANONICAL_WORKLOAD_TRACE_SHA256,
+                    },
+                    "artifact_sha256": {
+                        "raw_workload_evidence": "e" * 64,
+                        "source_equivalent_command": "f" * 64,
                     },
                 }
             },
@@ -402,20 +500,41 @@ class SubmissionSelectorTests(unittest.TestCase):
         )
         self.assertEqual(summary, {"ers": 0.62, "successful_requests": 420})
 
+    def test_raw_workload_gate_requires_canonical_trace_and_each_output(self) -> None:
+        report = raw_benchmark_report()
+        evidence = RECORDER._canonical_workload_evidence(report, "shortconv-fp8")
+        self.assertEqual(
+            evidence["trace_sha256"], RECORDER.CANONICAL_WORKLOAD_TRACE_SHA256
+        )
+        self.assertEqual(evidence["request_count"], 420)
+
+        wrong_output = json.loads(json.dumps(report))
+        wrong_output["runs"][0]["requests"][419]["output_tokens"] = 299
+        with self.assertRaisesRegex(ValueError, "exactly 300 output tokens"):
+            RECORDER._canonical_workload_evidence(wrong_output, "shortconv-fp8")
+
+        wrong_trace = json.loads(json.dumps(report))
+        wrong_trace["runs"][0]["trace"]["arrival"]["seed"] = 7
+        with self.assertRaisesRegex(ValueError, "canonical workload"):
+            RECORDER._canonical_workload_evidence(wrong_trace, "shortconv-fp8")
+
+    def test_gpqa_summary_requires_exact_diamond_task(self) -> None:
+        exact = RECORDER._summary_from_gpqa(
+            {"results": {"gpqa_diamond": {"acc,none": 0.36}}}
+        )
+        self.assertEqual(exact, {"task": "gpqa_diamond", "metrics": {"acc,none": 0.36}})
+
+        other_gpqa = RECORDER._summary_from_gpqa(
+            {"results": {"gpqa_main": {"acc,none": 0.99}}}
+        )
+        self.assertIsNone(RECORDER._gpqa_accuracy_from_summary(other_gpqa))
+
     def test_manifest_record_tracks_required_artifacts(self) -> None:
         compose = Path(__file__).parents[1] / "docker-compose.yml"
-        metrics_data = {
-            "runs": [
-                {
-                    "ers": 0.7,
-                    "successful_requests": 420,
-                    "expected_requests": 420,
-                    "failed_requests": 0,
-                    "ttft_ms": {"p95": 40},
-                    "tpot_ms": {"p95": 3},
-                }
-            ]
-        }
+        metrics_data = raw_benchmark_report()
+        metrics_data["runs"][0].update(
+            {"ers": 0.7, "ttft_ms": {"p95": 40}, "tpot_ms": {"p95": 3}}
+        )
         gpqa_data = {"results": {"gpqa_diamond": {"acc,none": 0.36}}}
 
         def fake_json_artifact(
@@ -477,78 +596,87 @@ class SubmissionSelectorTests(unittest.TestCase):
         self.assertEqual(record["startup_log"]["sha256"], "log-sha")
 
     def test_speculative_scheduler_record_requires_bound_preflight_manifest(self) -> None:
-        parent = SELECTOR.render_compose("speculative-draft", V6_COMPOSE, CUSTOM_IMAGE)
-        child = SELECTOR.render_compose("speculative-draft-batch1536", parent)
-        metrics_data = {
-            "runs": [
-                {
-                    "expected_requests": 420,
-                    "successful_requests": 420,
-                    "failed_requests": 0,
-                    "speculative_decoding": measured_speculative_evidence(),
-                }
-            ]
-        }
+        metrics_data = raw_benchmark_report(measured_speculative_evidence())
         gpqa_data = {"results": {"gpqa_diamond": {"acc,none": 0.36}}}
         greedy_data = {"matches_expected": True, "responses": []}
         resolved_data = {"max_num_seqs": 256, "chunked_prefill": True}
+        compose = Path(__file__).parents[1] / "docker-compose.yml"
+        hashes = {
+            "metrics": "a" * 64,
+            "gpqa": "b" * 64,
+            "GPQA": "b" * 64,
+            "greedy comparison": "c" * 64,
+            "resolved vLLM config": "d" * 64,
+            "run manifest": "e" * 64,
+            "raw workload evidence": "f" * 64,
+            "source-equivalent command": "0" * 64,
+        }
+        raw_evidence_data = raw_workload_evidence_artifact(metrics_data, hashes["metrics"])
+        manifest_data = {
+            "repository_commit": "b" * 40,
+            "profile": "speculative-draft-v6-fp8-smoke",
+            "offline_serving": dict(RECORDER.OFFLINE_SERVING_ENV),
+            "portal_candidate": {
+                "candidate": "speculative-draft-batch1536",
+                "image_reference": CUSTOM_IMAGE,
+                "image_digest": CUSTOM_DIGEST,
+                "compose_sha256": RECORDER.sha256(compose),
+                "source_equivalent_preflight": True,
+            },
+            "workload": {
+                "expected_requests": 420,
+                "seed": 42,
+                "request_rate": "inf",
+                "output_tokens": 300,
+                "trace_sha256": RECORDER.CANONICAL_WORKLOAD_TRACE_SHA256,
+            },
+            "artifact_sha256": {
+                "metrics": hashes["metrics"],
+                "gpqa": hashes["gpqa"],
+                "greedy_comparison": hashes["greedy comparison"],
+                "resolved_vllm_config": hashes["resolved vLLM config"],
+                "startup_log": "1" * 64,
+                "raw_workload_evidence": hashes["raw workload evidence"],
+                "source_equivalent_command": hashes["source-equivalent command"],
+            },
+        }
 
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            compose = root / "candidate.yml"
-            metrics = root / "metrics.json"
-            gpqa = root / "gpqa.json"
-            greedy = root / "greedy.json"
-            resolved = root / "resolved.json"
-            startup_log = root / "vllm.log"
-            run_manifest = root / "run_manifest.json"
-            compose.write_text(child, encoding="utf-8")
-            metrics.write_text(json.dumps(metrics_data), encoding="utf-8")
-            gpqa.write_text(json.dumps(gpqa_data), encoding="utf-8")
-            greedy.write_text(json.dumps(greedy_data), encoding="utf-8")
-            resolved.write_text(json.dumps(resolved_data), encoding="utf-8")
-            startup_log.write_text("resolved settings", encoding="utf-8")
-            manifest_data = {
-                "repository_commit": "b" * 40,
-                "profile": "speculative-draft-v6-fp8-smoke",
-                "portal_candidate": {
-                    "candidate": "speculative-draft-batch1536",
-                    "image_reference": CUSTOM_IMAGE,
-                    "image_digest": CUSTOM_DIGEST,
-                    "compose_sha256": RECORDER.sha256(compose),
-                    "source_equivalent_preflight": True,
-                },
-                "workload": {
-                    "expected_requests": 420,
-                    "seed": 42,
-                    "request_rate": "inf",
-                    "output_tokens": 300,
-                    "trace_sha256": "c" * 64,
-                },
-                "artifact_sha256": {
-                    "metrics": RECORDER.sha256(metrics),
-                    "gpqa": RECORDER.sha256(gpqa),
-                    "greedy_comparison": RECORDER.sha256(greedy),
-                    "resolved_vllm_config": RECORDER.sha256(resolved),
-                    "startup_log": RECORDER.sha256(startup_log),
-                },
-            }
-            run_manifest.write_text(json.dumps(manifest_data), encoding="utf-8")
-            args = RECORDER.build_parser().parse_args(
-                [
-                    "--candidate", "speculative-draft-batch1536",
-                    "--compose", str(compose),
-                    "--metrics", str(metrics),
-                    "--gpqa", str(gpqa),
-                    "--greedy-comparison", str(greedy),
-                    "--resolved-vllm-config", str(resolved),
-                    "--startup-log", str(startup_log),
-                    "--run-manifest", str(run_manifest),
-                    "--ers", "75",
-                    "--healthcheck-passed",
-                    "--preflight-successful-requests", "420",
-                ]
-            )
+        def fake_json_artifact(path: Path | None, label: str) -> dict[str, object] | None:
+            if path is None:
+                return None
+            data = {
+                "metrics": metrics_data,
+                "GPQA": gpqa_data,
+                "greedy comparison": greedy_data,
+                "resolved vLLM config": resolved_data,
+                "run manifest": manifest_data,
+                "raw workload evidence": raw_evidence_data,
+                "source-equivalent command": source_equivalent_command_artifact(),
+            }[label]
+            return {"path": f"{label}.json", "sha256": hashes[label], "data": data}
+
+        args = RECORDER.build_parser().parse_args(
+            [
+                "--candidate", "speculative-draft-batch1536",
+                "--compose", str(compose),
+                "--image-reference", CUSTOM_IMAGE,
+                "--image-digest", CUSTOM_DIGEST,
+                "--metrics", "metrics.json", "--gpqa", "gpqa.json",
+                "--greedy-comparison", "greedy.json",
+                "--resolved-vllm-config", "resolved.json", "--startup-log", "vllm.log",
+                "--run-manifest", "run_manifest.json",
+                "--raw-workload-evidence", "raw_workload_evidence.json",
+                "--source-equivalent-command", "source_command.json",
+                "--ers", "75", "--healthcheck-passed",
+                "--preflight-successful-requests", "420",
+            ]
+        )
+        with (
+            patch.object(RECORDER, "_json_artifact", side_effect=fake_json_artifact),
+            patch.object(
+                RECORDER, "_file_artifact", return_value={"path": "vllm.log", "sha256": "1" * 64}
+            ),
+        ):
             record = RECORDER.build_record(args)
             self.assertEqual(record["candidate"], "speculative-draft-batch1536")
             self.assertEqual(
@@ -556,9 +684,13 @@ class SubmissionSelectorTests(unittest.TestCase):
                 CUSTOM_DIGEST,
             )
 
-            manifest_data["portal_candidate"]["compose_sha256"] = "0" * 64
-            run_manifest.write_text(json.dumps(manifest_data), encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "Compose SHA-256"):
+            manifest_data["workload"]["trace_sha256"] = "c" * 64
+            with self.assertRaisesRegex(ValueError, "trace_sha256"):
+                RECORDER.build_record(args)
+            manifest_data["workload"]["trace_sha256"] = RECORDER.CANONICAL_WORKLOAD_TRACE_SHA256
+
+            manifest_data["offline_serving"] = {"HF_HUB_OFFLINE": "0"}
+            with self.assertRaisesRegex(ValueError, "offline_serving"):
                 RECORDER.build_record(args)
 
     def test_manifest_record_rejects_non_docker_hub_custom_image(self) -> None:

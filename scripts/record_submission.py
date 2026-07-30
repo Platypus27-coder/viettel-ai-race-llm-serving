@@ -11,6 +11,25 @@ from typing import Any
 
 
 EXPECTED_WORKLOAD_REQUESTS = 420
+CANONICAL_WORKLOAD_TRACE_SHA256 = (
+    "09deb30b9a136403af819dee53531342a4bdb6d00bff16aaf9aa6a00cbd47e3c"
+)
+CANONICAL_WORKLOAD_TRACE = {
+    "num_conversations": 70,
+    "user_turns_per_conversation": 6,
+    "shared_system_prefix_tokens": 1000,
+    "per_conversation_prefix_tokens": 1000,
+    "new_user_tokens_per_turn": 150,
+    "output_tokens_per_turn_pinned": 300,
+}
+CANONICAL_WORKLOAD_ARRIVAL = {
+    "kind": "poisson",
+    "seed": 42,
+    "request_rate": "inf",
+}
+CANONICAL_OUTPUT_TOKENS = 300
+GPQA_DIAMOND_TASK = "gpqa_diamond"
+OFFLINE_SERVING_ENV = {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"}
 MANIFEST_SCHEMA_VERSION = 4
 MINIMUM_ACCURACY = 0.32
 PREFERRED_ACCURACY = 0.35
@@ -82,6 +101,8 @@ def _gpqa_accuracy_from_summary(summary: dict[str, Any] | None) -> float | None:
     """Return the authoritative GPQA score from an lm-eval results artifact."""
     if not isinstance(summary, dict):
         return None
+    if summary.get("task") != GPQA_DIAMOND_TASK:
+        return None
     metrics = summary.get("metrics")
     if not isinstance(metrics, dict):
         return None
@@ -106,6 +127,175 @@ def artifact_gpqa_accuracy(record: dict[str, Any]) -> float | None:
 
 def _benchmark_summary(record: dict[str, Any]) -> dict[str, Any] | None:
     return _artifact_summary(record, "metrics")
+
+
+def _is_exact_int(value: Any) -> bool:
+    """Reject bools and numeric strings in evidence that must be exact counts."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _single_benchmark_run(data: Any, candidate: str | None) -> dict[str, Any]:
+    """Return the one raw benchmark run bound to ``candidate``.
+
+    Portal promotion only accepts the one-run artifact emitted by the repository
+    benchmark.  A comparison report is accepted only when it has one matching
+    candidate and that candidate has exactly one run.
+    """
+    if not isinstance(data, dict):
+        raise ValueError("--metrics must be a benchmark JSON object")
+
+    runs: Any
+    comparisons = data.get("results")
+    if isinstance(comparisons, list):
+        matches = [
+            item
+            for item in comparisons
+            if isinstance(item, dict) and item.get("candidate") == candidate
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                "--metrics must contain exactly one comparison result for the candidate"
+            )
+        runs = matches[0].get("runs")
+    else:
+        runs = data.get("runs")
+
+    if not isinstance(runs, list) or len(runs) != 1 or not isinstance(runs[0], dict):
+        raise ValueError("--metrics must contain exactly one completed raw benchmark run")
+    return runs[0]
+
+
+def _require_canonical_trace(trace: Any) -> None:
+    if not isinstance(trace, dict):
+        raise ValueError("--metrics raw run is missing its trace")
+    for key, expected in CANONICAL_WORKLOAD_TRACE.items():
+        if trace.get(key) != expected:
+            raise ValueError(f"--metrics trace {key} is not the canonical workload")
+    arrival = trace.get("arrival")
+    if not isinstance(arrival, dict):
+        raise ValueError("--metrics trace arrival is missing")
+    for key, expected in CANONICAL_WORKLOAD_ARRIVAL.items():
+        if arrival.get(key) != expected:
+            raise ValueError(
+                f"--metrics trace arrival {key} is not the canonical workload"
+            )
+
+
+def _canonical_workload_evidence(data: Any, candidate: str | None) -> dict[str, Any]:
+    """Validate raw request evidence for the published 70x6 workload.
+
+    Aggregate counters alone are insufficient: require all 420 unique
+    conversation/turn records, successful completion, and exactly 300 output
+    tokens for every record.  The returned compact marker is stored with the
+    submission manifest after the original, hashed benchmark JSON is archived.
+    """
+    run = _single_benchmark_run(data, candidate)
+    _require_canonical_trace(run.get("trace"))
+
+    expected_counts = {
+        "expected_requests": EXPECTED_WORKLOAD_REQUESTS,
+        "observed_requests": EXPECTED_WORKLOAD_REQUESTS,
+        "successful_requests": EXPECTED_WORKLOAD_REQUESTS,
+        "failed_requests": 0,
+    }
+    for key, expected in expected_counts.items():
+        value = run.get(key)
+        if not _is_exact_int(value) or value != expected:
+            raise ValueError(
+                f"--metrics raw run {key} must equal {expected} for the canonical workload"
+            )
+    success_rate = run.get("success_rate")
+    if (
+        isinstance(success_rate, bool)
+        or not isinstance(success_rate, (int, float))
+        or float(success_rate) != 1.0
+    ):
+        raise ValueError("--metrics raw run success_rate must equal 1.0")
+
+    failures = run.get("failures")
+    if not isinstance(failures, list) or failures:
+        raise ValueError("--metrics raw run failures must be an empty list")
+    requests = run.get("requests")
+    if not isinstance(requests, list) or len(requests) != EXPECTED_WORKLOAD_REQUESTS:
+        raise ValueError("--metrics raw run must retain all 420 request records")
+
+    expected_coordinates = {
+        (conversation_id, turn)
+        for conversation_id in range(CANONICAL_WORKLOAD_TRACE["num_conversations"])
+        for turn in range(
+            1, CANONICAL_WORKLOAD_TRACE["user_turns_per_conversation"] + 1
+        )
+    }
+    observed_coordinates: set[tuple[int, int]] = set()
+    for index, request in enumerate(requests):
+        if not isinstance(request, dict):
+            raise ValueError(f"--metrics request {index} must be an object")
+        conversation_id = request.get("conversation_id")
+        turn = request.get("turn")
+        if not _is_exact_int(conversation_id) or not _is_exact_int(turn):
+            raise ValueError(f"--metrics request {index} has invalid conversation_id/turn")
+        coordinate = (conversation_id, turn)
+        if coordinate not in expected_coordinates or coordinate in observed_coordinates:
+            raise ValueError(
+                f"--metrics request {index} has a duplicate or out-of-range conversation/turn"
+            )
+        observed_coordinates.add(coordinate)
+        if request.get("success") is not True:
+            raise ValueError(f"--metrics request {index} is not successful")
+        output_tokens = request.get("output_tokens")
+        if not _is_exact_int(output_tokens) or output_tokens != CANONICAL_OUTPUT_TOKENS:
+            raise ValueError(
+                f"--metrics request {index} must contain exactly "
+                f"{CANONICAL_OUTPUT_TOKENS} output tokens"
+            )
+    if observed_coordinates != expected_coordinates:
+        raise ValueError("--metrics raw request records do not cover the canonical 70x6 trace")
+
+    request_fingerprint = hashlib.sha256(
+        json.dumps(
+            sorted(observed_coordinates), separators=(",", ":"), allow_nan=False
+        ).encode("utf-8")
+    ).hexdigest()
+    raw_request_fingerprint = hashlib.sha256(
+        json.dumps(requests, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    return {
+        "trace_sha256": CANONICAL_WORKLOAD_TRACE_SHA256,
+        "raw_run_count": 1,
+        "request_count": EXPECTED_WORKLOAD_REQUESTS,
+        "successful_request_count": EXPECTED_WORKLOAD_REQUESTS,
+        "output_tokens_per_request": CANONICAL_OUTPUT_TOKENS,
+        "request_coordinates_sha256": request_fingerprint,
+        "raw_request_records_sha256": raw_request_fingerprint,
+    }
+
+
+def _passes_canonical_workload_evidence(evidence: Any) -> bool:
+    if not isinstance(evidence, dict):
+        return False
+    return (
+        evidence.get("trace_sha256") == CANONICAL_WORKLOAD_TRACE_SHA256
+        and evidence.get("raw_run_count") == 1
+        and evidence.get("request_count") == EXPECTED_WORKLOAD_REQUESTS
+        and evidence.get("successful_request_count") == EXPECTED_WORKLOAD_REQUESTS
+        and evidence.get("output_tokens_per_request") == CANONICAL_OUTPUT_TOKENS
+        and isinstance(evidence.get("request_coordinates_sha256"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", evidence["request_coordinates_sha256"])
+        is not None
+        and isinstance(evidence.get("raw_request_records_sha256"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", evidence["raw_request_records_sha256"])
+        is not None
+    )
+
+
+def _require_compact_hashes(hashes: Any, *names: str) -> bool:
+    return isinstance(hashes, dict) and all(
+        isinstance(hashes.get(name), str)
+        and re.fullmatch(r"[0-9a-f]{64}", hashes[name]) is not None
+        for name in names
+    )
 
 
 def passes_accuracy_gate(record: dict[str, Any]) -> bool:
@@ -149,6 +339,7 @@ def passes_preflight(record: dict[str, Any]) -> bool:
         and artifact_expected == EXPECTED_WORKLOAD_REQUESTS
         and artifact_successful == artifact_expected
         and artifact_failed == 0
+        and _passes_canonical_workload_evidence(summary.get("workload_evidence"))
     )
 
 
@@ -215,7 +406,10 @@ def passes_speculative_run_manifest(record: dict[str, Any]) -> bool:
         return False
     portal_candidate = summary.get("portal_candidate")
     workload = summary.get("workload")
+    artifact_hashes = summary.get("artifact_sha256")
     if not isinstance(portal_candidate, dict) or not isinstance(workload, dict):
+        return False
+    if not isinstance(artifact_hashes, dict):
         return False
     if (
         portal_candidate.get("candidate") != candidate
@@ -231,12 +425,17 @@ def passes_speculative_run_manifest(record: dict[str, Any]) -> bool:
     return (
         isinstance(summary.get("profile"), str)
         and summary["profile"].startswith("speculative-draft")
+        and summary.get("offline_serving") == OFFLINE_SERVING_ENV
         and workload.get("expected_requests") == EXPECTED_WORKLOAD_REQUESTS
         and workload.get("seed") == 42
         and workload.get("request_rate") == "inf"
         and workload.get("output_tokens") == 300
-        and isinstance(workload.get("trace_sha256"), str)
-        and re.fullmatch(r"[0-9a-f]{64}", workload["trace_sha256"]) is not None
+        and workload.get("trace_sha256") == CANONICAL_WORKLOAD_TRACE_SHA256
+        and _require_compact_hashes(
+            artifact_hashes,
+            "raw_workload_evidence",
+            "source_equivalent_command",
+        )
     )
 
 
@@ -361,6 +560,81 @@ def _require_equal(value: Any, expected: Any, label: str) -> None:
         raise ValueError(f"{label} does not match the submitted candidate")
 
 
+def _require_sha256(value: Any, label: str) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise ValueError(f"{label} is missing or invalid")
+    return value
+
+
+def _validate_raw_workload_evidence_artifact(
+    data: Any,
+    *,
+    metrics_sha256: str | None,
+    raw_request_records_sha256: str,
+) -> None:
+    evidence = _require_mapping(data, "--raw-workload-evidence")
+    _require_equal(evidence.get("required"), True, "raw workload evidence required")
+    _require_equal(evidence.get("passed"), True, "raw workload evidence passed")
+    _require_equal(
+        evidence.get("raw_benchmark_sha256"),
+        metrics_sha256,
+        "raw workload evidence benchmark SHA-256",
+    )
+    workload = _require_mapping(evidence.get("workload"), "raw workload evidence workload")
+    for key, expected in {
+        "expected_requests": EXPECTED_WORKLOAD_REQUESTS,
+        "seed": 42,
+        "request_rate": "inf",
+        "output_tokens": CANONICAL_OUTPUT_TOKENS,
+        "trace_sha256": CANONICAL_WORKLOAD_TRACE_SHA256,
+    }.items():
+        _require_equal(workload.get(key), expected, f"raw workload evidence {key}")
+    for key, expected in {
+        "expected_requests": EXPECTED_WORKLOAD_REQUESTS,
+        "observed_requests": EXPECTED_WORKLOAD_REQUESTS,
+        "successful_requests": EXPECTED_WORKLOAD_REQUESTS,
+        "failed_requests": 0,
+    }.items():
+        _require_equal(evidence.get(key), expected, f"raw workload evidence {key}")
+    _require_equal(
+        evidence.get("request_records_sha256"),
+        raw_request_records_sha256,
+        "raw workload evidence request-records SHA-256",
+    )
+    records = evidence.get("per_request_completion_evidence")
+    if not isinstance(records, list) or len(records) != EXPECTED_WORKLOAD_REQUESTS:
+        raise ValueError("raw workload evidence must retain all 420 completion records")
+    for index, record in enumerate(records):
+        if not isinstance(record, dict):
+            raise ValueError(f"raw workload evidence completion {index} must be an object")
+        if record.get("success") is not True or record.get("output_tokens") != CANONICAL_OUTPUT_TOKENS:
+            raise ValueError(
+                f"raw workload evidence completion {index} is not an exact successful "
+                f"{CANONICAL_OUTPUT_TOKENS}-token request"
+            )
+
+
+def _validate_source_equivalent_command_artifact(data: Any) -> None:
+    command = _require_mapping(data, "--source-equivalent-command")
+    _require_equal(
+        command.get("captured_before_server_start"),
+        True,
+        "source-equivalent command captured_before_server_start",
+    )
+    _require_equal(
+        command.get("source_equivalent_preflight"),
+        True,
+        "source-equivalent command source_equivalent_preflight",
+    )
+    _require_equal(
+        command.get("offline_serving"),
+        OFFLINE_SERVING_ENV,
+        "source-equivalent command offline_serving",
+    )
+    if not isinstance(command.get("command"), list) or not command["command"]:
+        raise ValueError("source-equivalent command must retain the vLLM command list")
+
+
 def _validate_speculative_run_manifest(
     data: Any,
     *,
@@ -373,6 +647,8 @@ def _validate_speculative_run_manifest(
     greedy_sha256: str | None,
     resolved_config_sha256: str | None,
     startup_log_sha256: str | None,
+    raw_workload_evidence_sha256: str | None,
+    source_equivalent_command_sha256: str | None,
 ) -> None:
     """Reject evidence that is not bound to the submitted draft Compose.
 
@@ -399,6 +675,11 @@ def _validate_speculative_run_manifest(
     _require_equal(
         portal_candidate.get("compose_sha256"), compose_sha256, "run manifest Compose SHA-256"
     )
+    _require_equal(
+        manifest.get("offline_serving"),
+        OFFLINE_SERVING_ENV,
+        "run manifest offline_serving",
+    )
 
     repository_commit = manifest.get("repository_commit")
     if not isinstance(repository_commit, str) or not COMMIT_SHA.fullmatch(repository_commit):
@@ -416,10 +697,11 @@ def _validate_speculative_run_manifest(
     }
     for key, expected in required_workload.items():
         _require_equal(workload.get(key), expected, f"run manifest workload {key}")
-    if not isinstance(workload.get("trace_sha256"), str) or not re.fullmatch(
-        r"[0-9a-f]{64}", workload["trace_sha256"]
-    ):
-        raise ValueError("run manifest workload trace_sha256 is missing or invalid")
+    _require_equal(
+        workload.get("trace_sha256"),
+        CANONICAL_WORKLOAD_TRACE_SHA256,
+        "run manifest workload trace_sha256",
+    )
 
     artifact_hashes = _require_mapping(
         manifest.get("artifact_sha256"), "run manifest artifact_sha256"
@@ -430,6 +712,8 @@ def _validate_speculative_run_manifest(
         "greedy_comparison": greedy_sha256,
         "resolved_vllm_config": resolved_config_sha256,
         "startup_log": startup_log_sha256,
+        "raw_workload_evidence": raw_workload_evidence_sha256,
+        "source_equivalent_command": source_equivalent_command_sha256,
     }
     for key, expected in expected_hashes.items():
         if expected is None:
@@ -446,6 +730,7 @@ def _summary_from_run_manifest(data: Any) -> dict[str, Any] | None:
     return {
         "repository_commit": data.get("repository_commit"),
         "profile": data.get("profile"),
+        "offline_serving": data.get("offline_serving"),
         "portal_candidate": portal_candidate if isinstance(portal_candidate, dict) else None,
         "workload": workload if isinstance(workload, dict) else None,
         "artifact_sha256": hashes if isinstance(hashes, dict) else None,
@@ -490,7 +775,15 @@ def _summary_from_metrics(
         "speculative_decoding",
         "config_fingerprint",
     )
-    return {key: summary[key] for key in keys if key in summary}
+    compact = {key: summary[key] for key in keys if key in summary}
+    try:
+        compact["workload_evidence"] = _canonical_workload_evidence(data, candidate)
+    except ValueError:
+        # ``build_record`` turns this into a hard failure for every challenger.
+        # Keeping summary extraction tolerant lets selection read historical v6
+        # records without pretending that aggregate-only data is sufficient.
+        pass
+    return compact
 
 
 def _summary_from_gpqa(data: Any) -> dict[str, Any] | None:
@@ -498,9 +791,9 @@ def _summary_from_gpqa(data: Any) -> dict[str, Any] | None:
         return None
     results = data.get("results")
     if isinstance(results, dict):
-        for task_name, metrics in results.items():
-            if "gpqa" in str(task_name).lower() and isinstance(metrics, dict):
-                return {"task": task_name, "metrics": metrics}
+        metrics = results.get(GPQA_DIAMOND_TASK)
+        if isinstance(metrics, dict):
+            return {"task": GPQA_DIAMOND_TASK, "metrics": metrics}
     return {"keys": sorted(data.keys())}
 
 
@@ -575,6 +868,10 @@ def build_record(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError(f"{args.candidate} requires --greedy-comparison")
     if args.candidate in SPECULATIVE_DRAFT_CANDIDATES and args.run_manifest is None:
         raise ValueError(f"{args.candidate} requires --run-manifest")
+    if args.candidate in SPECULATIVE_DRAFT_CANDIDATES and args.raw_workload_evidence is None:
+        raise ValueError(f"{args.candidate} requires --raw-workload-evidence")
+    if args.candidate in SPECULATIVE_DRAFT_CANDIDATES and args.source_equivalent_command is None:
+        raise ValueError(f"{args.candidate} requires --source-equivalent-command")
 
     metrics = _json_artifact(args.metrics, "metrics")
     gpqa = _json_artifact(args.gpqa, "GPQA")
@@ -582,6 +879,17 @@ def build_record(args: argparse.Namespace) -> dict[str, Any]:
     resolved_config = _json_artifact(args.resolved_vllm_config, "resolved vLLM config")
     startup_log = _file_artifact(args.startup_log, "startup log")
     run_manifest = _json_artifact(args.run_manifest, "run manifest")
+    raw_workload_evidence = _json_artifact(
+        args.raw_workload_evidence, "raw workload evidence"
+    )
+    source_equivalent_command = _json_artifact(
+        args.source_equivalent_command, "source-equivalent command"
+    )
+    workload_evidence: dict[str, Any] | None = None
+    if args.candidate != INCUMBENT:
+        if not metrics:
+            raise ValueError(f"{args.candidate} is missing required benchmark evidence")
+        workload_evidence = _canonical_workload_evidence(metrics["data"], args.candidate)
     if args.candidate in SPECULATIVE_DRAFT_CANDIDATES:
         if not all(
             (
@@ -591,9 +899,17 @@ def build_record(args: argparse.Namespace) -> dict[str, Any]:
                 resolved_config,
                 startup_log,
                 run_manifest,
+                raw_workload_evidence,
+                source_equivalent_command,
             )
         ):
             raise ValueError(f"{args.candidate} is missing required preflight evidence")
+        _validate_raw_workload_evidence_artifact(
+            raw_workload_evidence["data"],
+            metrics_sha256=metrics["sha256"],
+            raw_request_records_sha256=workload_evidence["raw_request_records_sha256"],
+        )
+        _validate_source_equivalent_command_artifact(source_equivalent_command["data"])
         _validate_speculative_run_manifest(
             run_manifest["data"],
             candidate=args.candidate,
@@ -605,6 +921,8 @@ def build_record(args: argparse.Namespace) -> dict[str, Any]:
             greedy_sha256=greedy_comparison["sha256"],
             resolved_config_sha256=resolved_config["sha256"],
             startup_log_sha256=startup_log["sha256"],
+            raw_workload_evidence_sha256=raw_workload_evidence["sha256"],
+            source_equivalent_command_sha256=source_equivalent_command["sha256"],
         )
     if metrics:
         metrics["summary"] = _summary_from_metrics(metrics["data"], args.candidate)
@@ -620,6 +938,10 @@ def build_record(args: argparse.Namespace) -> dict[str, Any]:
     if run_manifest:
         run_manifest["summary"] = _summary_from_run_manifest(run_manifest["data"])
         del run_manifest["data"]
+    if raw_workload_evidence:
+        del raw_workload_evidence["data"]
+    if source_equivalent_command:
+        del source_equivalent_command["data"]
 
     recorded_accuracy = args.accuracy
     if args.candidate != INCUMBENT:
@@ -628,7 +950,8 @@ def build_record(args: argparse.Namespace) -> dict[str, Any]:
         )
         if gpqa_accuracy is None:
             raise ValueError(
-                "--gpqa must contain an lm-eval GPQA accuracy metric such as acc,none"
+                "--gpqa must contain the exact lm-eval gpqa_diamond task with "
+                "an accuracy metric such as acc,none"
             )
         if (
             args.accuracy is not None
@@ -684,6 +1007,8 @@ def build_record(args: argparse.Namespace) -> dict[str, Any]:
         "greedy_comparison": greedy_comparison,
         "startup_log": startup_log,
         "run_manifest": run_manifest,
+        "raw_workload_evidence": raw_workload_evidence,
+        "source_equivalent_command": source_equivalent_command,
         "ers": args.ers,
         "ers_normalized": normalized_ers({"ers": args.ers}),
         "accuracy": recorded_accuracy,
@@ -751,6 +1076,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--run-manifest",
         type=Path,
         help="Colab source-equivalent preflight manifest required by draft candidates",
+    )
+    parser.add_argument(
+        "--raw-workload-evidence",
+        type=Path,
+        help="Colab raw per-request workload evidence required by draft candidates",
+    )
+    parser.add_argument(
+        "--source-equivalent-command",
+        type=Path,
+        help="Colab pre-start source-equivalent vLLM command required by draft candidates",
     )
     parser.add_argument("--startup-log", "--log", dest="startup_log", type=Path)
     parser.add_argument("--ers", type=float, required=True)

@@ -273,6 +273,8 @@ conda run -n viettel python scripts/record_submission.py `
   --startup-log artifacts/speculative-draft/vllm.log `
   --resolved-vllm-config artifacts/speculative-draft/startup_resolved_config.json `
   --run-manifest artifacts/speculative-draft/run_manifest.json `
+  --raw-workload-evidence artifacts/speculative-draft/raw_workload_evidence.json `
+  --source-equivalent-command artifacts/speculative-draft/source_equivalent_server_command.json `
   --healthcheck-passed --preflight-successful-requests 420 `
   --ers <portal-ers> --accuracy <gpqa-accuracy> --f-delta 1.0 --portal-valid
 ```
@@ -283,12 +285,18 @@ zero failures, its GPQA artifact passes accuracy, and it strictly improves
 v6's portal ERS. If ERS values are within 0.01, use higher accuracy and then
 lower p95 TTFT as tie-breakers.
 
-For `speculative-draft`, also pass
-`--greedy-comparison artifacts/speculative-draft/greedy-compare.json`; the
-manifest rejects it unless the recorded comparison says every greedy response
-matched the non-speculative parent, and unless `/metrics` proves a run-scoped,
-reset-free speculative counter delta with observed drafts and mean acceptance
-length at least 3.5.
+The recorder rejects aggregate-only benchmark claims: the raw artifact must
+contain exactly one run of the pinned grading trace
+(`09deb30b9a136403af819dee53531342a4bdb6d00bff16aaf9aa6a00cbd47e3c`), all
+420 unique conversation/turn records, and exactly 300 successful output tokens
+per record. Accuracy evidence must be the exact lm-eval `gpqa_diamond` task;
+other GPQA variants do not satisfy the gate.
+
+For `speculative-draft`, the recorder also requires the raw workload and
+pre-start source-equivalent command artifacts shown above. It rejects the run
+unless every greedy response matched the non-speculative parent, serving was
+explicitly offline, and `/metrics` proves a run-scoped, reset-free speculative
+counter delta with observed drafts and mean acceptance length at least 3.5.
 
 ## Constraints
 
