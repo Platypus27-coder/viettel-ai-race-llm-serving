@@ -22,10 +22,10 @@ conda run -n viettel python ..\scripts\select_submission.py `
   --custom-image 'DOCKERHUB_USER/viettel-ai-vllm:shortconv-fp8@sha256:<64-hex>' `
   --output ..\artifacts\shortconv-fp8.yml
 
-# Same winner plus the baked local draft model, 4 draft tokens, TP=1.
+# v6 plus only the baked local draft model, 4 draft tokens, TP=1.
 conda run -n viettel python ..\scripts\select_submission.py `
   --candidate speculative-draft `
-  --custom-image 'DOCKERHUB_USER/viettel-ai-vllm:shortconv-fp8-draft350@sha256:<64-hex>' `
+  --custom-image 'DOCKERHUB_USER/viettel-ai-vllm:speculative-draft@sha256:<64-hex>' `
   --output ..\artifacts\speculative-draft.yml
 
 # Scheduler-only experiments, run after choosing the better parent.

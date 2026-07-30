@@ -1,5 +1,6 @@
-# Build the digest-pinned ShortConv-FP8 vLLM image without mutating the root
-# portal artifact. Push only after the local build and preflight have passed.
+# Build one digest-pinned custom vLLM candidate without mutating the root
+# portal artifact. The two modes are isolated: ShortConv-FP8 or draft-only
+# speculative decoding. Push only after local build and preflight pass.
 
 param(
     [Parameter(Mandatory = $false)]
@@ -9,7 +10,7 @@ param(
     [string]$ImageRepository = "viettel-ai-vllm",
 
     [Parameter(Mandatory = $false)]
-    [ValidateSet("shortconv-fp8", "shortconv-fp8-draft350m")]
+    [ValidateSet("shortconv-fp8", "speculative-draft")]
     [string]$Variant = "shortconv-fp8",
 
     [Parameter(Mandatory = $false)]
@@ -42,17 +43,20 @@ if (-not $ImageTag) {
 }
 
 $Image = "$DockerHubUsername/$ImageRepository`:$ImageTag"
-$BakeDraft = if ($Variant -eq "shortconv-fp8-draft350m") { "1" } else { "0" }
+$BakeDraft = if ($Variant -eq "speculative-draft") { "1" } else { "0" }
+$EnableShortConvFp8 = if ($Variant -eq "shortconv-fp8") { "1" } else { "0" }
 
 Write-Host "Viettel custom image build" -ForegroundColor Cyan
 Write-Host "  Variant: $Variant"
 Write-Host "  Image:   $Image"
 Write-Host "  Draft baked: $BakeDraft"
+Write-Host "  ShortConv FP8 patch: $EnableShortConvFp8"
 
 if (-not $PushOnly) {
     $BuildArguments = @(
         "build",
         "--platform", "linux/amd64",
+        "--build-arg", "ENABLE_SHORTCONV_FP8=$EnableShortConvFp8",
         "--build-arg", "BAKE_DRAFT_MODEL=$BakeDraft",
         "--tag", $Image,
         "--file", (Join-Path $ProjectDir "Dockerfile")
@@ -93,7 +97,7 @@ if (-not $BuildOnly) {
     Write-Host "  $RepoDigest"
     Write-Host ""
     Write-Host "Render (do not overwrite root yet):" -ForegroundColor Cyan
-    if ($Variant -eq "shortconv-fp8-draft350m") {
+    if ($Variant -eq "speculative-draft") {
         Write-Host "  conda run -n viettel python scripts/select_submission.py --candidate speculative-draft --custom-image '$RepoDigest' --output artifacts/speculative-draft.yml"
     } else {
         Write-Host "  conda run -n viettel python scripts/select_submission.py --candidate shortconv-fp8 --custom-image '$RepoDigest' --output artifacts/shortconv-fp8.yml"

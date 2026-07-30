@@ -1,0 +1,9 @@
+# The custom image requires only the Dockerfile and these two build helpers.
+# A default-deny context prevents source history, benchmark artifacts, model
+# weights, notebook outputs, caches, and credentials from entering an image.
+**
+!Dockerfile
+!docker/
+!docker/shortconv-fp8/
+!docker/shortconv-fp8/patch_vllm_shortconv_fp8.py
+!docker/shortconv-fp8/bake_draft_model.py

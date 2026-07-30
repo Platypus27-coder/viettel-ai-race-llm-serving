@@ -35,9 +35,10 @@ automatic prefix caching, với `max-model-len=8192` và
 
 ## Thứ tự thử nghiệm mới
 
-1. Custom image vLLM 0.22.1: FP8 cho `ShortConv.in_proj` và `out_proj`.
-2. Nếu preflight đạt: speculative draft local `LFM2.5-350M`, bốn speculative
-   tokens; nếu không đạt, dùng batch 1536.
+1. Preflight speculative draft độc lập: target v6 + draft local
+   `LFM2.5-350M`, bốn draft tokens, TP=1, context 8192. Bắt buộc greedy
+   equality, 420/420, GPQA và acceptance metrics trước portal.
+2. ShortConv FP8 chỉ là A/B độc lập, không kết hợp với draft.
 3. Parent thắng + `--max-num-batched-tokens=1536`.
 4. Nếu còn lượt: parent thắng + `--max-num-batched-tokens=1024`.
 

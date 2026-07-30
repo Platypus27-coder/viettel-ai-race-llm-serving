@@ -37,7 +37,19 @@ IMAGE_LINE = re.compile(
     r"^(?P<indent>[ \t]*)image:[ \t]*(?P<value>.+?)[ \t]*$", re.MULTILINE
 )
 COMMAND_ITEM = re.compile(r"^(?P<indent>\s*)-\s+(?P<value>.+?)\s*$")
-DIGEST = re.compile(r"@sha256:[0-9a-fA-F]{64}$")
+# The contest accepts custom images only from public Docker Hub repositories.
+# Keep the renderer fail-closed: a digest alone does not make a GHCR/private
+# registry image eligible for submission.  Docker Hub accepts the short form
+# ``namespace/repository`` and its explicit ``docker.io`` aliases.
+DOCKER_HUB_DIGEST_IMAGE = re.compile(
+    r"^(?:(?:docker\.io|index\.docker\.io)/)?"
+    # A dot in the first path component denotes a registry host in Docker's
+    # reference grammar, never a short-form Docker Hub namespace.
+    r"[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?/"
+    r"[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?"
+    r"(?::[A-Za-z0-9_][A-Za-z0-9_.-]*)?"
+    r"@sha256:[0-9a-fA-F]{64}$"
+)
 
 
 @dataclass(frozen=True)
@@ -64,7 +76,8 @@ CANDIDATES: dict[str, Candidate] = {
         "speculative-draft",
         "v6 with the baked local LFM2.5-350M draft model (4 draft tokens).",
         additional_arguments=(
-            '--speculative-config={"model":"/opt/draft/LFM2.5-350M",'
+            '--speculative-config={"method":"draft_model",'
+            '"model":"/opt/draft/LFM2.5-350M",'
             '"num_speculative_tokens":4,"draft_tensor_parallel_size":1,'
             '"max_model_len":8192}',
         ),
@@ -194,9 +207,11 @@ def render_compose(
     if candidate.requires_custom_image:
         if not custom_image:
             raise ValueError(f"{candidate.name} requires --custom-image pinned by digest")
-        if not DIGEST.search(custom_image):
+        if not DOCKER_HUB_DIGEST_IMAGE.fullmatch(custom_image):
             raise ValueError(
-                "--custom-image must be immutable and end with @sha256:<64 hex chars>"
+                "--custom-image must be a Docker Hub namespace/repository "
+                "pinned by @sha256:<64 hex chars>; verify public pull access "
+                "before promotion"
             )
     elif custom_image:
         raise ValueError(f"{candidate.name} must keep the incumbent image")

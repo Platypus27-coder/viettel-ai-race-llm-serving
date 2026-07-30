@@ -7,6 +7,7 @@
 # patched deterministic; do not replace it with a floating tag.
 FROM vllm/vllm-openai:v0.22.1@sha256:55c9bcee9fc66644b139fddae8a7a03e4c0c8a25ab5c64b0ce614554a8abf5d5
 
+ARG ENABLE_SHORTCONV_FP8=0
 ARG BAKE_DRAFT_MODEL=0
 ARG DRAFT_MODEL_ID=LiquidAI/LFM2.5-350M
 # Immutable checkpoint revision verified against all required files on
@@ -16,10 +17,14 @@ ARG DRAFT_MODEL_REVISION=1575d1b8b67d862834836087765bff2ef4020672
 COPY docker/shortconv-fp8/patch_vllm_shortconv_fp8.py /opt/vllm-patches/
 COPY docker/shortconv-fp8/bake_draft_model.py /opt/vllm-patches/
 
-# Refuse to patch a different vLLM release and fail the build if the expected
-# source anchors drift. The patch only quantizes ShortConv's two GEMM
-# projections; conv1d remains untouched.
-RUN python3 -B /opt/vllm-patches/patch_vllm_shortconv_fp8.py --apply --verify
+# Keep the high-upside draft-only candidate isolated from the small ShortConv
+# FP8 experiment. When enabled, the patch refuses a different vLLM source and
+# only quantizes ShortConv's two GEMM projections; conv1d remains untouched.
+RUN case "${ENABLE_SHORTCONV_FP8}" in \
+      0) echo "ShortConv FP8 patch disabled." ;; \
+      1) python3 -B /opt/vllm-patches/patch_vllm_shortconv_fp8.py --apply --verify ;; \
+      *) echo "ENABLE_SHORTCONV_FP8 must be exactly 0 or 1." >&2; exit 2 ;; \
+    esac
 
 # The default path does not download a second model. Supplying
 # --build-arg BAKE_DRAFT_MODEL=1 downloads the pinned draft checkpoint into

@@ -39,7 +39,31 @@ V6_COMPOSE = """services:
 """
 
 CUSTOM_DIGEST = "sha256:" + "a" * 64
-CUSTOM_IMAGE = f"registry.example/lfm-shortconv@{CUSTOM_DIGEST}"
+CUSTOM_IMAGE = f"exampleuser/viettel-ai-vllm@{CUSTOM_DIGEST}"
+
+
+def benchmark_summary(
+    speculative_decoding: dict[str, object] | None = None,
+) -> dict[str, object]:
+    summary: dict[str, object] = {
+        "expected_requests": 420,
+        "successful_requests": 420,
+        "failed_requests": 0,
+    }
+    if speculative_decoding is not None:
+        summary["speculative_decoding"] = speculative_decoding
+    return summary
+
+
+def measured_speculative_evidence(mean_acceptance_length: float = 3.6) -> dict[str, object]:
+    return {
+        "available": True,
+        "counter_scope": "benchmark_delta",
+        "acceptance_status": "measured",
+        "counter_reset_detected": False,
+        "counters": {"num_drafts": 100.0},
+        "mean_acceptance_length": mean_acceptance_length,
+    }
 
 
 def incumbent(ers: float = 61.41) -> dict[str, object]:
@@ -58,13 +82,23 @@ def challenger(
         "candidate": candidate,
         "ers": ers,
         "accuracy": 0.36,
-        "gpqa": {"summary": {"task": "gpqa_diamond"}},
+        "metrics": {"summary": benchmark_summary()},
         "portal_valid": True,
         "healthcheck_passed": True,
         "preflight_successful_requests": 420,
         "preflight_expected_requests": 420,
     }
     record.update(overrides)
+    if candidate in RECORDER.CUSTOM_IMAGE_CANDIDATES:
+        record.setdefault("image_reference", CUSTOM_IMAGE)
+        record.setdefault("image_digest", CUSTOM_DIGEST)
+    if "gpqa" not in overrides:
+        record["gpqa"] = {
+            "summary": {
+                "task": "gpqa_diamond",
+                "metrics": {"acc,none": float(record["accuracy"])},
+            }
+        }
     return record
 
 
@@ -86,6 +120,7 @@ class SubmissionSelectorTests(unittest.TestCase):
             "speculative-draft", V6_COMPOSE, CUSTOM_IMAGE
         )
         self.assertIn("--speculative-config=", rendered)
+        self.assertIn('"method":"draft_model"', rendered)
         self.assertIn('"model":"/opt/draft/LFM2.5-350M"', rendered)
         self.assertIn('"num_speculative_tokens":4', rendered)
         self.assertIn('"draft_tensor_parallel_size":1', rendered)
@@ -104,10 +139,26 @@ class SubmissionSelectorTests(unittest.TestCase):
     def test_custom_candidate_requires_an_immutable_digest(self) -> None:
         with self.assertRaisesRegex(ValueError, "pinned by digest"):
             SELECTOR.render_compose("shortconv-fp8", V6_COMPOSE)
-        with self.assertRaisesRegex(ValueError, "immutable"):
+        with self.assertRaisesRegex(ValueError, "Docker Hub"):
             SELECTOR.render_compose(
                 "shortconv-fp8", V6_COMPOSE, "registry.example/lfm:latest"
             )
+
+    def test_custom_candidate_rejects_non_docker_hub_or_malformed_reference(self) -> None:
+        for reference in (
+            f"ghcr.io/example/viettel-ai-vllm@{CUSTOM_DIGEST}",
+            f"registry.example/viettel-ai-vllm@{CUSTOM_DIGEST}",
+            f"exampleuser/viettel-ai-vllm@{CUSTOM_DIGEST}\n    command: bad",
+        ):
+            with self.subTest(reference=reference), self.assertRaisesRegex(
+                ValueError, "Docker Hub"
+            ):
+                SELECTOR.render_compose("shortconv-fp8", V6_COMPOSE, reference)
+
+        rendered = SELECTOR.render_compose(
+            "shortconv-fp8", V6_COMPOSE, f"docker.io/{CUSTOM_IMAGE}"
+        )
+        self.assertIn(f"image: docker.io/{CUSTOM_IMAGE}", rendered)
 
     def test_selector_rejects_a_source_with_uncontrolled_scheduler_flags(self) -> None:
         invalid = V6_COMPOSE + "      - --max-num-seqs=64\n"
@@ -141,6 +192,35 @@ class SubmissionSelectorTests(unittest.TestCase):
         self.assertIsNotNone(best)
         self.assertEqual(best["candidate"], "v6-incumbent")
 
+        artifact_failure = challenger(
+            ers=75.0,
+            metrics={
+                "summary": {
+                    **benchmark_summary(),
+                    "failed_requests": 1,
+                    "successful_requests": 419,
+                }
+            },
+        )
+        best = RECORDER.choose_best([incumbent(), artifact_failure])
+        self.assertIsNotNone(best)
+        self.assertEqual(best["candidate"], "v6-incumbent")
+
+    def test_challenger_uses_gpqa_artifact_not_manual_accuracy_claim(self) -> None:
+        bad_gpqa = challenger(
+            ers=75.0,
+            accuracy=0.99,
+            gpqa={
+                "summary": {
+                    "task": "gpqa_diamond",
+                    "metrics": {"acc,none": 0.20},
+                }
+            },
+        )
+        best = RECORDER.choose_best([incumbent(), bad_gpqa])
+        self.assertIsNotNone(best)
+        self.assertEqual(best["candidate"], "v6-incumbent")
+
     def test_speculative_candidate_needs_matching_greedy_artifact(self) -> None:
         speculative = challenger("speculative-draft", 75.0)
         best = RECORDER.choose_best([incumbent(), speculative])
@@ -152,7 +232,37 @@ class SubmissionSelectorTests(unittest.TestCase):
         }
         best = RECORDER.choose_best([incumbent(), speculative])
         self.assertIsNotNone(best)
+        self.assertEqual(best["candidate"], "v6-incumbent")
+
+        speculative["metrics"] = {
+            "summary": benchmark_summary(measured_speculative_evidence())
+        }
+        best = RECORDER.choose_best([incumbent(), speculative])
+        self.assertIsNotNone(best)
         self.assertEqual(best["candidate"], "speculative-draft")
+
+    def test_speculative_candidate_rejects_weak_or_reset_acceptance_evidence(self) -> None:
+        speculative = challenger(
+            "speculative-draft",
+            75.0,
+            greedy_comparison={"summary": {"matches_expected": True}},
+        )
+        for evidence in (
+            measured_speculative_evidence(3.49),
+            {
+                **measured_speculative_evidence(),
+                "counter_reset_detected": True,
+            },
+            {
+                **measured_speculative_evidence(),
+                "acceptance_status": "no_drafts_observed",
+            },
+        ):
+            speculative["metrics"] = {"summary": benchmark_summary(evidence)}
+            with self.subTest(evidence=evidence):
+                best = RECORDER.choose_best([incumbent(), speculative])
+                self.assertIsNotNone(best)
+                self.assertEqual(best["candidate"], "v6-incumbent")
 
     def test_accuracy_breaks_ties_between_valid_challengers(self) -> None:
         lower_accuracy = challenger("batch1536", 63.0, accuracy=0.33)
@@ -187,6 +297,7 @@ class SubmissionSelectorTests(unittest.TestCase):
                     "ers": 0.7,
                     "successful_requests": 420,
                     "expected_requests": 420,
+                    "failed_requests": 0,
                     "ttft_ms": {"p95": 40},
                     "tpot_ms": {"p95": 3},
                 }
@@ -251,6 +362,25 @@ class SubmissionSelectorTests(unittest.TestCase):
         self.assertNotIn("data", record["metrics"])
         self.assertNotIn("data", record["gpqa"])
         self.assertEqual(record["startup_log"]["sha256"], "log-sha")
+
+    def test_manifest_record_rejects_non_docker_hub_custom_image(self) -> None:
+        compose = Path(__file__).parents[1] / "docker-compose.yml"
+        args = RECORDER.build_parser().parse_args(
+            [
+                "--candidate",
+                "shortconv-fp8",
+                "--compose",
+                str(compose),
+                "--image-reference",
+                f"ghcr.io/example/viettel-ai-vllm@{CUSTOM_DIGEST}",
+                "--image-digest",
+                CUSTOM_DIGEST,
+                "--ers",
+                "62.0",
+            ]
+        )
+        with self.assertRaisesRegex(ValueError, "Docker Hub"):
+            RECORDER.build_record(args)
 
 
 if __name__ == "__main__":

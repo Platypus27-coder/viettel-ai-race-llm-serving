@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "selection_policy": {
     "minimum_accuracy": 0.32,
     "preferred_accuracy": 0.35,
@@ -11,6 +11,12 @@
       "420_of_420_preflight",
       "strict_portal_ers_gain_over_v6"
     ],
+    "speculative_draft_requires": {
+      "greedy_equivalence": true,
+      "metrics_scope": "benchmark_delta",
+      "counter_reset_detected": false,
+      "minimum_mean_acceptance_length": 3.5
+    },
     "tie_breakers": [
       "higher_accuracy",
       "lower_p95_ttft_ms"

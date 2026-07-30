@@ -17,10 +17,12 @@ from benchmark.benchmark_ers import (
     build_prompts,
     fit_text_to_tokens,
     load_trace,
+    parse_vllm_metrics_text,
     run_benchmark,
     run_conversation,
     score_tpot,
     score_ttft,
+    summarize_speculative_decoding,
     summarize_results,
 )
 
@@ -137,6 +139,87 @@ class ScoringAndTraceTests(unittest.TestCase):
         self.assertEqual(summary["expected_requests"], 4)
         self.assertEqual(summary["failed_requests"], 3)
         self.assertAlmostEqual(summary["ers"], 0.25)
+
+    def test_spec_decode_metrics_use_workload_counter_delta(self) -> None:
+        before = parse_vllm_metrics_text(
+            "\n".join(
+                (
+                    "# TYPE vllm:spec_decode_num_drafts counter",
+                    'vllm:spec_decode_num_drafts_total{model_name="lfm draft"} 10 1700000000000',
+                    'vllm:spec_decode_num_draft_tokens_total{model_name="lfm draft"} 37',
+                    'vllm:spec_decode_num_accepted_tokens_total{model_name="lfm draft"} 25',
+                    'vllm:spec_decode_num_accepted_tokens_per_pos_total{model_name="lfm draft",position="0"} 10',
+                    'vllm:spec_decode_num_accepted_tokens_per_pos_total{model_name="lfm draft",position="1"} 8',
+                    # A Prometheus bookkeeping series must not be counted as a
+                    # vLLM counter.
+                    'vllm:spec_decode_num_drafts_created{model_name="lfm draft"} 1.7e9',
+                )
+            )
+        )
+        after = parse_vllm_metrics_text(
+            "\n".join(
+                (
+                    'vllm:spec_decode_num_drafts_total{model_name="lfm draft"} 30',
+                    'vllm:spec_decode_num_draft_tokens_total{model_name="lfm draft"} 105',
+                    'vllm:spec_decode_num_accepted_tokens_total{model_name="lfm draft"} 70',
+                    'vllm:spec_decode_num_accepted_tokens_per_pos_total{model_name="lfm draft",position="0"} 30',
+                    'vllm:spec_decode_num_accepted_tokens_per_pos_total{model_name="lfm draft",position="1"} 22',
+                    'vllm:spec_decode_num_accepted_tokens_per_pos_total{model_name="lfm draft",position="2"} 11',
+                    "vllm:gpu_prefix_cache_hit_rate 0.75",
+                )
+            )
+        )
+
+        summary = summarize_speculative_decoding(
+            before, after, duration=2.5, successful_requests=18
+        )
+
+        self.assertTrue(summary["available"])
+        self.assertEqual(summary["counter_scope"], "benchmark_delta")
+        self.assertEqual(summary["acceptance_status"], "measured")
+        self.assertEqual(summary["counters"]["num_drafts"], 20.0)
+        self.assertEqual(summary["counters"]["num_draft_tokens"], 68.0)
+        self.assertEqual(summary["counters"]["num_accepted_tokens"], 45.0)
+        self.assertEqual(
+            summary["counters"]["num_accepted_tokens_per_position"],
+            {"0": 20.0, "1": 14.0, "2": 11.0},
+        )
+        self.assertAlmostEqual(summary["mean_acceptance_length"], 3.25)
+        self.assertAlmostEqual(summary["draft_token_acceptance_rate"], 45 / 68)
+        self.assertEqual(
+            summary["acceptance_rate_per_draft_position"],
+            {"0": 1.0, "1": 0.7, "2": 0.55},
+        )
+        self.assertAlmostEqual(summary["accepted_tokens_per_second"], 18.0)
+
+    def test_spec_decode_metrics_report_missing_and_counter_reset(self) -> None:
+        no_metrics = summarize_speculative_decoding({}, {}, 1.0, 1)
+        self.assertFalse(no_metrics["available"])
+        self.assertEqual(no_metrics["acceptance_status"], "not_available")
+
+        before = parse_vllm_metrics_text(
+            "\n".join(
+                (
+                    "vllm:spec_decode_num_drafts_total 12",
+                    "vllm:spec_decode_num_draft_tokens_total 40",
+                    "vllm:spec_decode_num_accepted_tokens_total 20",
+                )
+            )
+        )
+        after = parse_vllm_metrics_text(
+            "\n".join(
+                (
+                    "vllm:spec_decode_num_drafts_total 2",
+                    "vllm:spec_decode_num_draft_tokens_total 6",
+                    "vllm:spec_decode_num_accepted_tokens_total 3",
+                )
+            )
+        )
+        reset = summarize_speculative_decoding(before, after, 1.0, 1)
+        self.assertTrue(reset["available"])
+        self.assertTrue(reset["counter_reset_detected"])
+        self.assertEqual(reset["acceptance_status"], "counter_reset")
+        self.assertNotIn("mean_acceptance_length", reset)
 
 
 class ConversationIntegrationTests(unittest.IsolatedAsyncioTestCase):

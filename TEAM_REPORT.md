@@ -61,12 +61,21 @@ Nguồn: [vLLM defaults](https://github.com/vllm-project/vllm/blob/v0.22.1/vllm/
 LFM2 có 10 ShortConv và 6 attention blocks. Dynamic `--quantization=fp8` hiện
 không truyền `quant_config` vào `ShortConv.in_proj`/`out_proj`; custom image
 v0.22.1 sẽ chỉ phủ FP8 hai projection này, không sửa weights, `conv1d` hoặc
-`lm_head`. Đây là A/B có đòn bẩy decode rõ nhất trước khi thử speculative
-draft.
+`lm_head`. Đây là A/B hẹp và chỉ có upside tăng dần, không phải đường đáng tin
+cậy tới 75.
+
+Ứng viên có upside duy nhất hiện tại là speculative decoding tách riêng khỏi
+ShortConv: target giữ nguyên v6, draft `LFM2.5-350M` được bake offline, bốn
+draft tokens, draft TP=1 và context 8192. Chỉ dùng nếu 420/420, greedy output
+khớp parent, GPQA đạt ngưỡng, Mamba cache `align` được xác nhận và metric
+`mean_acceptance_length` đạt xấp xỉ 3.5 trở lên. Không bật
+`parallel_drafting` vì checkpoint 350M không được huấn luyện cho chế độ đó.
 
 Mục tiêu 75 không chỉ là TTFT: với TTFT xấp xỉ 45 ms và tỷ lệ thành công hiện
 tại, TPOT mean cần gần 2.5–2.6 ms. Bỏ năm lỗi chỉ có thể tăng khoảng dưới một
-điểm.
+điểm. Nếu speculative không đưa TPOT H200 xuống gần 2.7 ms hoặc thấp hơn, dừng
+kỳ vọng 75; khi đó chỉ profiling rồi fuse toàn bộ decode ShortConv/Mamba mới
+có upside đủ lớn.
 
 ## Quy tắc chọn submission
 

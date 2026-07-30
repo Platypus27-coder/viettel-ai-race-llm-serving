@@ -19,7 +19,7 @@ import re
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Optional, Protocol
+from typing import Any, Mapping, Optional, Protocol
 
 import aiohttp
 import numpy as np
@@ -33,6 +33,32 @@ GAMMA = 2
 W_TTFT = 0.5
 MODEL_NAME = "LFM2.5-1.2B-Instruct"
 DEFAULT_RATES = (0.5, 1.0, 2.0, 4.0, 8.0, math.inf)
+
+# vLLM exposes these counters when speculative decoding is enabled.  The
+# Prometheus client appends ``_total`` to Counter names, while the vLLM docs use
+# the names without that suffix, so accept both spellings when parsing a server
+# endpoint.  Keep this deliberately exact: a substring check can accidentally
+# count ``*_created`` or an unrelated metric label.
+SPEC_DECODE_METRIC_FIELDS = {
+    "vllm:spec_decode_num_drafts": "num_drafts",
+    "vllm:spec_decode_num_drafts_total": "num_drafts",
+    "vllm:spec_decode_num_draft_tokens": "num_draft_tokens",
+    "vllm:spec_decode_num_draft_tokens_total": "num_draft_tokens",
+    "vllm:spec_decode_num_accepted_tokens": "num_accepted_tokens",
+    "vllm:spec_decode_num_accepted_tokens_total": "num_accepted_tokens",
+    "vllm:spec_decode_num_accepted_tokens_per_pos": (
+        "num_accepted_tokens_per_position"
+    ),
+    "vllm:spec_decode_num_accepted_tokens_per_pos_total": (
+        "num_accepted_tokens_per_position"
+    ),
+}
+SPEC_DECODE_COUNTER_FIELDS = (
+    "num_drafts",
+    "num_draft_tokens",
+    "num_accepted_tokens",
+)
+POSITION_LABEL = re.compile(r'(?:^|,)position="(?P<position>\d+)"(?:,|$)')
 
 
 class TokenizerLike(Protocol):
@@ -546,7 +572,45 @@ async def wait_for_health(base_url: str, attempts: int = 60) -> None:
     raise RuntimeError(f"Server did not become healthy at {base_url}")
 
 
-async def fetch_vllm_metrics(base_url: str) -> dict[str, float]:
+def _prometheus_sample_name_and_value(line: str) -> tuple[str, float] | None:
+    """Parse one ordinary Prometheus sample line without requiring a client.
+
+    vLLM's endpoint does not include timestamps, but a third timestamp field is
+    permitted by the Prometheus text format.  Parsing from the right supports
+    either form and preserves spaces inside a quoted label value.  Metric labels
+    are kept in the returned name so labelled series stay distinct in the raw
+    server-metrics artifact.
+    """
+    line = line.strip()
+    value_fields = line.rsplit(maxsplit=1)
+    if len(value_fields) != 2:
+        return None
+    sample_name, raw_value = value_fields
+    try:
+        value = float(raw_value)
+    except ValueError:
+        return None
+    if not math.isfinite(value):
+        return None
+
+    # A valid timestamp is a second trailing number.  ``rsplit`` keeps the
+    # entire labelled sample name intact even if a quoted label contains space.
+    timestamp_fields = line.rsplit(maxsplit=2)
+    if len(timestamp_fields) == 3:
+        possible_name, possible_value, possible_timestamp = timestamp_fields
+        try:
+            timestamp = float(possible_timestamp)
+            timestamp_value = float(possible_value)
+        except ValueError:
+            pass
+        else:
+            if math.isfinite(timestamp) and math.isfinite(timestamp_value):
+                return possible_name, timestamp_value
+    return sample_name, value
+
+
+def parse_vllm_metrics_text(body: str) -> dict[str, float]:
+    """Select benchmark-relevant vLLM samples from a Prometheus response."""
     selected: dict[str, float] = {}
     patterns = (
         "time_to_first_token",
@@ -556,7 +620,193 @@ async def fetch_vllm_metrics(base_url: str) -> dict[str, float]:
         "num_requests",
         "prompt_tokens",
         "generation_tokens",
+        "spec_decode",
     )
+    for line in body.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        sample = _prometheus_sample_name_and_value(line)
+        if sample is None:
+            continue
+        name, value = sample
+        metric_name = name.split("{", maxsplit=1)[0]
+        if any(pattern in metric_name for pattern in patterns):
+            selected[name] = value
+    return selected
+
+
+def _metric_name_and_labels(sample_name: str) -> tuple[str, str]:
+    """Split a Prometheus sample name into its base metric name and labels."""
+    metric_name, separator, labels = sample_name.partition("{")
+    return metric_name, labels.rstrip("}") if separator else ""
+
+
+def _empty_spec_decode_counters() -> dict[str, Any]:
+    return {
+        "num_drafts": 0.0,
+        "num_draft_tokens": 0.0,
+        "num_accepted_tokens": 0.0,
+        "num_accepted_tokens_per_position": {},
+    }
+
+
+def extract_spec_decode_counters(
+    server_metrics: Mapping[str, float],
+) -> dict[str, Any] | None:
+    """Aggregate vLLM speculative-decoding counters across label series.
+
+    ``/metrics`` can include a model label and the per-position counter has a
+    ``position`` label.  Aggregating the former but retaining the latter makes
+    the result independent of the number of worker/model label series while
+    preserving the acceptance curve.
+    """
+    counters = _empty_spec_decode_counters()
+    found = False
+    per_position = counters["num_accepted_tokens_per_position"]
+
+    for sample_name, value in server_metrics.items():
+        metric_name, labels = _metric_name_and_labels(sample_name)
+        field = SPEC_DECODE_METRIC_FIELDS.get(metric_name)
+        if field is None:
+            continue
+        found = True
+        if field == "num_accepted_tokens_per_position":
+            match = POSITION_LABEL.search(labels)
+            if match is None:
+                continue
+            position = match.group("position")
+            per_position[position] = per_position.get(position, 0.0) + value
+        else:
+            counters[field] += value
+
+    return counters if found else None
+
+
+def _spec_decode_counter_delta(
+    before: Mapping[str, Any], after: Mapping[str, Any]
+) -> tuple[dict[str, Any], bool]:
+    """Return an interval counter delta and whether a counter reset occurred."""
+    delta = _empty_spec_decode_counters()
+    counter_reset = False
+    for field in SPEC_DECODE_COUNTER_FIELDS:
+        value = float(after.get(field, 0.0)) - float(before.get(field, 0.0))
+        if value < 0:
+            counter_reset = True
+        delta[field] = value
+
+    before_positions = before.get("num_accepted_tokens_per_position", {})
+    after_positions = after.get("num_accepted_tokens_per_position", {})
+    positions = sorted(set(before_positions) | set(after_positions), key=int)
+    for position in positions:
+        value = float(after_positions.get(position, 0.0)) - float(
+            before_positions.get(position, 0.0)
+        )
+        if value < 0:
+            counter_reset = True
+        delta["num_accepted_tokens_per_position"][position] = value
+    return delta, counter_reset
+
+
+def summarize_speculative_decoding(
+    before_metrics: Mapping[str, float],
+    after_metrics: Mapping[str, float],
+    duration: float,
+    successful_requests: int,
+) -> dict[str, Any]:
+    """Derive run-scoped speculative acceptance statistics from ``/metrics``.
+
+    The benchmark snapshots the Prometheus endpoint immediately before and
+    after its workload.  The delta is essential: otherwise counters can include
+    a warm-up or an earlier benchmark.  If no speculative metric is exposed,
+    this returns an explicit non-result rather than treating it as zero
+    acceptance.
+    """
+    before = extract_spec_decode_counters(before_metrics)
+    after = extract_spec_decode_counters(after_metrics)
+    if after is None:
+        return {
+            "available": False,
+            "acceptance_status": "not_available",
+            "reason": "vLLM did not expose speculative-decoding counters",
+        }
+
+    if before is None:
+        # This can happen when a collector starts emitting the series only after
+        # its first speculative step.  The stats are still useful, but make the
+        # weaker scope visible in the JSON rather than implying an exact delta.
+        before = _empty_spec_decode_counters()
+        counter_scope = "server_lifetime_or_first_observation"
+    else:
+        counter_scope = "benchmark_delta"
+
+    counters, counter_reset = _spec_decode_counter_delta(before, after)
+    summary: dict[str, Any] = {
+        "available": True,
+        "counter_scope": counter_scope,
+        "counters_before": before,
+        "counters_after": after,
+        "counters": counters,
+        "counter_reset_detected": counter_reset,
+    }
+    if counter_reset:
+        summary.update(
+            {
+                "acceptance_status": "counter_reset",
+                "reason": (
+                    "A speculative counter decreased during the workload; "
+                    "acceptance ratios are intentionally not derived."
+                ),
+            }
+        )
+        return summary
+
+    drafts = counters["num_drafts"]
+    draft_tokens = counters["num_draft_tokens"]
+    accepted_tokens = counters["num_accepted_tokens"]
+    if drafts <= 0:
+        summary.update(
+            {
+                "acceptance_status": "no_drafts_observed",
+                "reason": "Speculative counters were present but no drafts ran.",
+            }
+        )
+        return summary
+
+    # This is vLLM's documented metric: every draft verification also emits one
+    # target-model token, hence the leading 1.  It is not a claim about output
+    # quality or a hardware-independent speedup.
+    per_position = {
+        position: value / drafts
+        for position, value in counters["num_accepted_tokens_per_position"].items()
+    }
+    summary.update(
+        {
+            "acceptance_status": "measured",
+            "mean_acceptance_length": 1.0 + accepted_tokens / drafts,
+            "draft_token_acceptance_rate": (
+                accepted_tokens / draft_tokens if draft_tokens > 0 else None
+            ),
+            "acceptance_rate_per_draft_position": per_position,
+            "accepted_tokens_per_second": (
+                accepted_tokens / duration if duration > 0 else None
+            ),
+            "draft_tokens_per_second": (
+                draft_tokens / duration if duration > 0 else None
+            ),
+            "drafts_per_successful_request": (
+                drafts / successful_requests if successful_requests > 0 else None
+            ),
+            "accepted_tokens_per_successful_request": (
+                accepted_tokens / successful_requests
+                if successful_requests > 0
+                else None
+            ),
+        }
+    )
+    return summary
+
+
+async def fetch_vllm_metrics(base_url: str) -> dict[str, float]:
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
@@ -564,21 +814,11 @@ async def fetch_vllm_metrics(base_url: str) -> dict[str, float]:
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as response:
                 if response.status != 200:
-                    return selected
+                    return {}
                 body = await response.text()
-        for line in body.splitlines():
-            if not line or line.startswith("#") or not any(p in line for p in patterns):
-                continue
-            name, _, raw_value = line.rpartition(" ")
-            try:
-                value = float(raw_value)
-                if math.isfinite(value):
-                    selected[name] = value
-            except ValueError:
-                continue
+        return parse_vllm_metrics_text(body)
     except (aiohttp.ClientError, asyncio.TimeoutError):
-        pass
-    return selected
+        return {}
 
 
 async def reset_prefix_cache(base_url: str) -> None:
@@ -745,6 +985,10 @@ async def run_benchmark(
         f"{trace.user_turns_per_conversation} turns, "
         f"rate={trace.arrival.request_rate}"
     )
+    # Snapshot before the first request so counters from a warm-up, GPQA run,
+    # or a prior rate in the same server process cannot be mistaken for this
+    # benchmark's speculative-decoding acceptance.
+    metrics_before = await fetch_vllm_metrics(base_url)
     start = time.perf_counter()
     connector = aiohttp.TCPConnector(limit=max(100, trace.num_conversations + 10))
     async with aiohttp.ClientSession(connector=connector) as session:
@@ -770,6 +1014,12 @@ async def run_benchmark(
     duration = time.perf_counter() - start
     metrics = await fetch_vllm_metrics(base_url)
     summary = summarize_results(results, trace, duration, metrics)
+    summary["speculative_decoding"] = summarize_speculative_decoding(
+        metrics_before,
+        metrics,
+        duration,
+        len([result for result in results if result.success]),
+    )
     summary["trace"] = trace_as_json_dict(trace)
     summary["config_fingerprint"] = config_fingerprint(trace, base_url)
     return summary
@@ -797,6 +1047,26 @@ def print_summary(summary: dict[str, Any]) -> None:
             f"TPOT ms: mean={tpot['mean']:.3f} p50={tpot['p50']:.3f} "
             f"p95={tpot['p95']:.3f} p99={tpot['p99']:.3f}"
         )
+    speculative = summary.get("speculative_decoding", {})
+    if speculative.get("available"):
+        counters = speculative["counters"]
+        status = speculative["acceptance_status"]
+        print(
+            "SpecDecode "
+            f"[{speculative['counter_scope']}]: status={status} "
+            f"drafts={counters['num_drafts']:.0f} "
+            f"draft_tokens={counters['num_draft_tokens']:.0f} "
+            f"accepted_tokens={counters['num_accepted_tokens']:.0f}"
+        )
+        if status == "measured":
+            acceptance_rate = speculative["draft_token_acceptance_rate"]
+            print(
+                "SpecDecode acceptance: "
+                f"mean_length={speculative['mean_acceptance_length']:.3f} "
+                f"draft_token_rate={acceptance_rate:.3%}"
+            )
+        elif speculative.get("reason"):
+            print(f"SpecDecode note: {speculative['reason']}")
     print("=" * 72)
 
 

@@ -1,32 +1,34 @@
-name: Publish and pin ShortConv FP8 Docker Hub image
+name: Build guarded custom Docker Hub candidate
 
-# The contest requires the custom serving image to be in a public Docker Hub
-# repository. Run this manually after adding the DOCKERHUB_TOKEN repository
-# secret; it then verifies anonymous pull access before changing the root
-# submission artifact.
+# The contest requires a public Docker Hub image. This workflow intentionally
+# does not replace root docker-compose.yml: image build/pull alone does not
+# prove 420/420 serving, greedy equivalence, or GPQA correctness.
 on:
   workflow_dispatch:
     inputs:
-      dockerhub_namespace:
-        description: Docker Hub username or organization that owns viettel-ai-vllm
+      candidate:
+        description: Controlled candidate to build (draft-only is the high-upside path)
         required: true
-        type: string
+        default: speculative-draft
+        type: choice
+        options:
+          - speculative-draft
+          - shortconv-fp8
 
 permissions:
   contents: read
 
 concurrency:
-  group: publish-shortconv-fp8-dockerhub
+  group: build-viettel-custom-dockerhub
   cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     outputs:
       digest: ${{ steps.build.outputs.digest }}
       image_name: ${{ steps.image.outputs.name }}
+      candidate: ${{ steps.variant.outputs.candidate }}
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -34,26 +36,60 @@ jobs:
       - name: Require Docker Hub access token
         env:
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE }}
         shell: bash
         run: |
-          if [ -z "$DOCKERHUB_TOKEN" ]; then
-            echo "Set repository secret DOCKERHUB_TOKEN to a Docker Hub access token, then rerun." >&2
+          if [ -z "$DOCKERHUB_TOKEN" ] || [ -z "$DOCKERHUB_NAMESPACE" ]; then
+            echo "Set repository secret DOCKERHUB_TOKEN and repository variable DOCKERHUB_NAMESPACE, then rerun." >&2
             exit 1
           fi
 
       - name: Resolve Docker Hub image name
         id: image
         env:
-          NAMESPACE: ${{ inputs.dockerhub_namespace }}
+          # This repository-controlled variable is deliberately not a
+          # workflow_dispatch input: a manual run must never publish to an
+          # arbitrary registry namespace supplied by the triggerer.
+          NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE }}
         shell: bash
         run: |
           set -euo pipefail
           namespace="${NAMESPACE,,}"
-          if ! [[ "$namespace" =~ ^[a-z0-9][a-z0-9._-]*$ ]]; then
+          if ! [[ "$namespace" =~ ^[a-z0-9]([a-z0-9_-]*[a-z0-9])?$ ]]; then
             echo "Docker Hub namespace is invalid: $NAMESPACE" >&2
             exit 1
           fi
           echo "name=${namespace}/viettel-ai-vllm" >> "$GITHUB_OUTPUT"
+
+      - name: Isolate the one candidate change
+        id: variant
+        env:
+          CANDIDATE: ${{ inputs.candidate }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$CANDIDATE" in
+            speculative-draft)
+              shortconv=0
+              bake_draft=1
+              ;;
+            shortconv-fp8)
+              shortconv=1
+              bake_draft=0
+              ;;
+            *)
+              echo "Unexpected candidate: $CANDIDATE" >&2
+              exit 2
+              ;;
+          esac
+          {
+            echo "candidate=${CANDIDATE}"
+            echo "tag=${CANDIDATE}"
+            echo "build_args<<EOF"
+            echo "ENABLE_SHORTCONV_FP8=${shortconv}"
+            echo "BAKE_DRAFT_MODEL=${bake_draft}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
@@ -62,10 +98,12 @@ jobs:
         uses: docker/login-action@v3
         with:
           registry: docker.io
-          username: ${{ inputs.dockerhub_namespace }}
+          # For a personal namespace this falls back to DOCKERHUB_NAMESPACE.
+          # Set DOCKERHUB_USERNAME when the namespace is an organization.
+          username: ${{ vars.DOCKERHUB_USERNAME || vars.DOCKERHUB_NAMESPACE }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and publish ShortConv FP8 image
+      - name: Build and publish the controlled candidate
         id: build
         uses: docker/build-push-action@v6
         with:
@@ -73,10 +111,10 @@ jobs:
           file: Dockerfile
           platforms: linux/amd64
           push: true
-          build-args: BAKE_DRAFT_MODEL=0
+          build-args: ${{ steps.variant.outputs.build_args }}
           tags: |
-            ${{ steps.image.outputs.name }}:shortconv-fp8
-            ${{ steps.image.outputs.name }}:shortconv-fp8-${{ github.sha }}
+            ${{ steps.image.outputs.name }}:${{ steps.variant.outputs.tag }}
+            ${{ steps.image.outputs.name }}:${{ steps.variant.outputs.tag }}-${{ github.sha }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
@@ -84,23 +122,28 @@ jobs:
       - name: Publish build result
         run: |
           {
-            echo "## ShortConv FP8 Docker Hub image"
+            echo "## ${{ steps.variant.outputs.candidate }} Docker Hub image"
             echo "\`${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}\`"
+            echo "This digest is not promoted to the portal Compose automatically."
           } >> "$GITHUB_STEP_SUMMARY"
 
   verify-public-pull:
     needs: build
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     steps:
       - name: Require anonymous Docker Hub manifest access
         env:
           IMAGE: ${{ needs.build.outputs.image_name }}
           DIGEST: ${{ needs.build.outputs.digest }}
+          CANDIDATE: ${{ needs.build.outputs.candidate }}
         shell: bash
         run: |
           set -euo pipefail
+          readonly expected_draft_model_id="LiquidAI/LFM2.5-350M"
+          readonly expected_draft_revision="1575d1b8b67d862834836087765bff2ef4020672"
+          readonly image_ref="${IMAGE}@${DIGEST}"
+          readonly manifest_accept="application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json"
+
           token="$(curl --fail --silent --show-error \
             "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${IMAGE}:pull" \
             | jq -r '.token // .access_token // empty')"
@@ -110,7 +153,7 @@ jobs:
           fi
           status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
             --header "Authorization: Bearer ${token}" \
-            --header 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+            --header "Accept: ${manifest_accept}" \
             "https://registry-1.docker.io/v2/${IMAGE}/manifests/${DIGEST}")"
           if [ "$status" != 200 ]; then
             echo "${IMAGE}@${DIGEST} is not anonymously pullable (HTTP ${status})." >&2
@@ -118,36 +161,78 @@ jobs:
             exit 1
           fi
 
-  pin-compose:
+          # This is a fresh runner and this separate Docker config is empty,
+          # so the digest pull is an end-to-end anonymous-pull check rather
+          # than a check accidentally satisfied by build-job credentials.
+          export DOCKER_CONFIG="${RUNNER_TEMP}/docker-anonymous-config"
+          mkdir -p "$DOCKER_CONFIG"
+          docker pull "$image_ref"
+          pulled_digest="$(docker image inspect "$image_ref" --format '{{index .RepoDigests 0}}')"
+          expected_short_ref="${IMAGE}@${DIGEST}"
+          expected_canonical_ref="docker.io/${IMAGE}@${DIGEST}"
+          if [ "$pulled_digest" != "$expected_short_ref" ] \
+            && [ "$pulled_digest" != "$expected_canonical_ref" ]; then
+            echo "Pulled image digest did not match the build output: ${pulled_digest}" >&2
+            exit 1
+          fi
+
+          # Docker create + cp reads the baked filesystem without starting the
+          # vLLM server or allocating a GPU. This proves that the digest has
+          # the exact offline draft checkpoint the speculative Compose names.
+          container_id="$(docker create --entrypoint /bin/true "$image_ref")"
+          cleanup() { docker rm -f "$container_id" >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          manifest_path="${RUNNER_TEMP}/draft-build-manifest.json"
+          case "$CANDIDATE" in
+            speculative-draft)
+              docker cp "${container_id}:/opt/draft/LFM2.5-350M/BUILD_MANIFEST.json" "$manifest_path"
+              jq -e \
+                --arg model_id "$expected_draft_model_id" \
+                --arg revision "$expected_draft_revision" \
+                '.model_id == $model_id
+                 and .revision == $revision
+                 and (.required_files | type == "array")
+                 and (.required_files | index("config.json") != null)
+                 and (.required_files | index("model.safetensors") != null)
+                 and (.required_files | index("tokenizer.json") != null)
+                 and (.required_files | index("tokenizer_config.json") != null)' \
+                "$manifest_path" >/dev/null
+              echo "Verified offline speculative draft manifest in ${image_ref}."
+              ;;
+            shortconv-fp8)
+              if docker cp "${container_id}:/opt/draft/LFM2.5-350M/BUILD_MANIFEST.json" "$manifest_path" 2>/dev/null; then
+                echo "shortconv-fp8 unexpectedly contains a baked draft model; candidates must stay isolated." >&2
+                exit 1
+              fi
+              echo "Confirmed shortconv-fp8 has no draft-model requirement."
+              ;;
+            *)
+              echo "Unexpected candidate from build job: ${CANDIDATE}" >&2
+              exit 2
+              ;;
+          esac
+
+  render-review-compose:
     needs: [build, verify-public-pull]
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
-      - name: Check out main
+      - name: Check out source
         uses: actions/checkout@v4
-        with:
-          ref: main
 
-      - name: Render the exact portal Compose
+      - name: Render the digest-pinned candidate for review
         env:
+          CANDIDATE: ${{ needs.build.outputs.candidate }}
           IMAGE: ${{ needs.build.outputs.image_name }}@${{ needs.build.outputs.digest }}
         run: |
           python3 scripts/select_submission.py \
-            --candidate shortconv-fp8 \
+            --candidate "$CANDIDATE" \
             --custom-image "$IMAGE" \
-            --output docker-compose.yml \
-            --promote
-          docker compose -f docker-compose.yml config --quiet
+            --output candidate-compose.yml
+          docker compose -f candidate-compose.yml config --quiet
 
-      - name: Commit digest-pinned Compose when it changed
-        run: |
-          if git diff --quiet -- docker-compose.yml; then
-            echo "Root Compose already points at this image digest."
-            exit 0
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add docker-compose.yml
-          git commit -m "chore: pin shortconv-fp8 Docker Hub digest"
-          git push origin HEAD:main
+      - name: Upload review Compose
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.candidate }}-compose-${{ github.sha }}
+          path: candidate-compose.yml
+          if-no-files-found: error

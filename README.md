@@ -21,11 +21,12 @@ The online evidence says v6 is the safest incumbent:
 --enable-prefix-caching
 ```
 
-The first controlled challenger is a custom image that adds vLLM dynamic FP8
-coverage to `ShortConv.in_proj` and `ShortConv.out_proj`. It makes no
-scheduler, attention-backend, CUDA-environment, KV-scale, or model-weight
-change. The patch is intentionally narrow because LFM2 has ten ShortConv
-blocks and only six attention blocks.
+The only current route with enough upside for 75 is a **draft-only
+speculative-decoding** image: the pinned `LFM2.5-350M` draft is baked at
+`/opt/draft/LFM2.5-350M`, while the target remains exactly v6. Its success is
+not assumed: it must prove 420/420, greedy equivalence, GPQA, high acceptance,
+and an H200 TPOT near 2.5-2.7 ms. The ShortConv-FP8 patch remains a separate,
+small controlled A/B; it is not combined with the draft candidate.
 
 Do not infer H200 latency from a Colab T4: T4 is used only for server startup,
 the 420-request workload, and accuracy screening. Native FP8 W8A8 throughput
@@ -71,6 +72,9 @@ The preflight gate is:
 - all 420 workload requests succeed with exactly 300 output tokens;
 - startup log records the resolved `max_num_batched_tokens`, `max_num_seqs`,
   chunked-prefill state, and Mamba cache mode;
+- for `speculative-draft`, the benchmark records `spec_decode` counter deltas
+  and a mean acceptance length; treat less than about 3.5 as a no-go for a
+  75-point attempt unless H200 evidence proves otherwise;
 - full GPQA Diamond is retained for v6 and for each quantized candidate; and
 - the result directory contains the benchmark JSON, GPQA JSON, startup log,
   resolved configuration, Compose SHA-256, and image digest.
@@ -82,19 +86,19 @@ submission directory. `--custom-image` must be a pushed immutable image
 reference, not a tag.
 
 ```powershell
-# Candidate 1 — ShortConv FP8 only.
+# Primary high-upside candidate — v6 plus only the baked LFM2.5-350M draft.
+conda run -n viettel python scripts/select_submission.py `
+  --candidate speculative-draft `
+  --custom-image 'DOCKERHUB_USER/viettel-ai-vllm:speculative-draft@sha256:<64-hex>' `
+  --output artifacts/speculative-draft.yml
+
+# Diagnostic low-upside A/B — v6 plus only ShortConv FP8 wiring.
 conda run -n viettel python scripts/select_submission.py `
   --candidate shortconv-fp8 `
   --custom-image 'DOCKERHUB_USER/viettel-ai-vllm:shortconv-fp8@sha256:<64-hex>' `
   --output artifacts/shortconv-fp8.yml
 
-# Candidate 2 — only after the baked-draft image passes preflight.
-conda run -n viettel python scripts/select_submission.py `
-  --candidate speculative-draft `
-  --custom-image 'DOCKERHUB_USER/viettel-ai-vllm:shortconv-fp8-draft350@sha256:<64-hex>' `
-  --output artifacts/speculative-draft.yml
-
-# Candidate 3 or fallback for candidate 2 — decode-oriented scheduler A/B.
+# Scheduler-only A/B after choosing a winning parent.
 conda run -n viettel python scripts/select_submission.py `
   --candidate batch1536 --output artifacts/batch1536.yml
 
@@ -106,7 +110,7 @@ conda run -n viettel python scripts/select_submission.py `
 Validate the rendered file before building/uploading it:
 
 ```powershell
-docker compose -f artifacts/shortconv-fp8.yml config --quiet
+docker compose -f artifacts/speculative-draft.yml config --quiet
 ```
 
 To deliberately make a reviewed candidate the root portal artifact, render it
@@ -114,42 +118,48 @@ directly to the root with the explicit guard:
 
 ```powershell
 conda run -n viettel python scripts/select_submission.py `
-  --candidate shortconv-fp8 `
-  --custom-image 'DOCKERHUB_USER/viettel-ai-vllm:shortconv-fp8@sha256:<64-hex>' `
+  --candidate speculative-draft `
+  --custom-image 'DOCKERHUB_USER/viettel-ai-vllm:speculative-draft@sha256:<64-hex>' `
   --output docker-compose.yml --promote
 ```
 
-The experiment order is ShortConv-FP8, then speculative draft only if it
-passes preflight, then the winning parent plus batch 1536, then batch 1024 if
-an attempt remains. Do not combine those changes. In particular, leave
+The experiment order is speculative draft after preflight, then ShortConv-FP8
+only as an isolated diagnostic if a portal A/B is still useful, then the
+winning parent plus batch 1536, then batch 1024 if an attempt remains. Do not
+combine those changes. In particular, leave
 `max-num-seqs`, block size, async scheduling, attention backend,
 `CUDA_DEVICE_MAX_CONNECTIONS`, and `--calculate-kv-scales` alone.
 
 The speculative candidate requires a second image built with the draft baked
 at `/opt/draft/LFM2.5-350M`; it uses exactly four draft tokens, draft TP 1,
 and the existing 8192 target context. Its greedy output must be compared with
-the non-speculative image before it reaches the portal.
+the non-speculative image before it reaches the portal. Never enable
+`parallel_drafting`: the ordinary 350M checkpoint was not trained as a
+parallel draft model.
 
-Capture the parent before restarting the server, then compare after the draft
-server reaches `/health`:
+Capture the parent with a separate v6 server, then start a fresh draft server
+and run its clean 420-request workload **before** comparing greedy outputs.
+The comparison sends requests and warms APC, so it must never precede the
+candidate workload in the same server process. If comparison must happen
+first, restart the draft server before the workload:
 
 ```powershell
 conda run -n viettel python benchmark/compare_greedy.py `
   --base-url http://localhost:8000 `
-  --output artifacts/shortconv-fp8/greedy-parent.json
+  --output artifacts/v6/greedy-parent.json
 
 # Restart with the speculative Compose/image, then:
 conda run -n viettel python benchmark/compare_greedy.py `
   --base-url http://localhost:8000 `
-  --expected artifacts/shortconv-fp8/greedy-parent.json `
+  --expected artifacts/v6/greedy-parent.json `
   --output artifacts/speculative-draft/greedy-compare.json
 ```
 
 ## Building the custom images
 
-The `Dockerfile` pins the official vLLM `v0.22.1` base by digest and aborts if
-the expected source anchors differ. A standard build contains just the
-ShortConv FP8 patch:
+The `Dockerfile` pins the official vLLM `v0.22.1` base by digest. It builds
+either one isolated change: `ENABLE_SHORTCONV_FP8=1` for the narrow FP8 patch,
+or `BAKE_DRAFT_MODEL=1` for the offline draft-only candidate.
 
 ### Required: public Docker Hub image
 
@@ -157,22 +167,27 @@ The contest rules require a custom image in a **public Docker Hub** repository;
 a GHCR image is therefore not a valid portal artifact. A Docker Hub namespace
 is unavoidable because it becomes part of the submitted image reference.
 
-No local Docker daemon is needed. To publish through GitHub Actions, create a
-Docker Hub access token with read/write access, add it once as the repository
-Actions secret `DOCKERHUB_TOKEN` (never paste it into a notebook or chat), and
-then run [`publish-shortconv-fp8.yml`](.github/workflows/publish-shortconv-fp8.yml)
-from **Actions → Run workflow**. Enter the Docker Hub username or organization
-namespace that owns the public `viettel-ai-vllm` repository.
+No local Docker daemon is needed. Create the public Docker Hub repository
+`<namespace>/viettel-ai-vllm`, then add a read/write Docker Hub access token as
+the repository Actions secret `DOCKERHUB_TOKEN` (never paste it into a notebook
+or chat). Add the image-owning namespace once as repository variable
+`DOCKERHUB_NAMESPACE`; if that namespace is an organization, also add the
+member login as `DOCKERHUB_USERNAME`. Run
+[`publish-shortconv-fp8.yml`](.github/workflows/publish-shortconv-fp8.yml)
+from **Actions → Run workflow** and select `speculative-draft`.
 
-The workflow builds the image, confirms anonymous Docker Hub pull access,
-validates Compose, and only then commits a digest-pinned `shortconv-fp8`
-root `docker-compose.yml`. Until that workflow succeeds, the root Compose
-stays on the valid official-image v6 incumbent.
+The workflow builds either controlled variant, confirms a fresh anonymous
+Docker Hub pull, inspects the baked draft manifest without starting a GPU
+server, validates a digest-pinned review Compose, and uploads that Compose as
+an Action artifact. It deliberately does **not** replace the root Compose:
+image publication alone is not evidence of a valid 420-request/GPQA candidate.
+Until all gates pass, the root Compose stays on the valid v6 incumbent.
 
 ### Alternative: local Docker / Docker Hub
 
 ```powershell
-docker build -t DOCKERHUB_USER/viettel-ai-vllm:shortconv-fp8 .
+docker build --build-arg ENABLE_SHORTCONV_FP8=1 `
+  -t DOCKERHUB_USER/viettel-ai-vllm:shortconv-fp8 .
 ```
 
 Or use the helper, which never edits `docker-compose.yml` and prints the
@@ -188,13 +203,13 @@ at build time only. The runtime has `HF_HUB_OFFLINE=1` and
 `TRANSFORMERS_OFFLINE=1`.
 
 ```powershell
-docker build --build-arg BAKE_DRAFT_MODEL=1 `
-  -t DOCKERHUB_USER/viettel-ai-vllm:shortconv-fp8-draft350 .
+docker build --build-arg ENABLE_SHORTCONV_FP8=0 --build-arg BAKE_DRAFT_MODEL=1 `
+  -t DOCKERHUB_USER/viettel-ai-vllm:speculative-draft .
 ```
 
 ```powershell
 .\scripts\build_and_push.ps1 -DockerHubUsername DOCKERHUB_USER `
-  -Variant shortconv-fp8-draft350m
+  -Variant speculative-draft
 ```
 
 After push, obtain the registry digest and use the full `image@sha256:...`
@@ -208,7 +223,7 @@ Run one workload against a healthy server:
 conda run -n viettel python benchmark/benchmark_ers.py `
   --trace 019e649f-4e27-74db-82da-920f57b13786/grading-workload-spec.json `
   --tokenizer-path /model --request-rate inf --seed 42 --runs 1 `
-  --output artifacts/shortconv-fp8/benchmark.json
+  --output artifacts/speculative-draft/benchmark.json
 ```
 
 Run full GPQA only on the GPU runner/Colab:
@@ -216,7 +231,7 @@ Run full GPQA only on the GPU runner/Colab:
 ```powershell
 conda run -n viettel python benchmark/test_accuracy.py `
   --base-url http://localhost:8000 --mode gpqa --task gpqa_diamond `
-  --output artifacts/shortconv-fp8/gpqa
+  --output artifacts/speculative-draft/gpqa
 ```
 
 Record the portal result and hashes in the tracked manifest (all artifact paths
@@ -224,25 +239,29 @@ are hashed; generated artifact content remains ignored):
 
 ```powershell
 conda run -n viettel python scripts/record_submission.py `
-  --candidate shortconv-fp8 --submission-id '<portal-id>' `
-  --compose artifacts/shortconv-fp8.yml `
-  --metrics artifacts/shortconv-fp8/benchmark.json `
-  --gpqa artifacts/shortconv-fp8/gpqa/results.json `
-  --startup-log artifacts/shortconv-fp8/vllm.log `
-  --resolved-vllm-config artifacts/shortconv-fp8/runtime.json `
+  --candidate speculative-draft --submission-id '<portal-id>' `
+  --compose artifacts/speculative-draft.yml `
+  --metrics artifacts/speculative-draft/benchmark.json `
+  --gpqa artifacts/speculative-draft/gpqa/results.json `
+  --greedy-comparison artifacts/speculative-draft/greedy-compare.json `
+  --startup-log artifacts/speculative-draft/vllm.log `
+  --resolved-vllm-config artifacts/speculative-draft/runtime.json `
   --healthcheck-passed --preflight-successful-requests 420 `
   --ers <portal-ers> --accuracy <gpqa-accuracy> --f-delta 1.0 --portal-valid
 ```
 
 `benchmark/submission_results.json` is the tracked decision manifest. It only
-recommends a non-v6 candidate when it has a full preflight, passes accuracy,
-and strictly improves v6's portal ERS. If ERS values are within 0.01, use
-higher accuracy and then lower p95 TTFT as tie-breakers.
+recommends a non-v6 candidate when its hashed benchmark proves 420/420 with
+zero failures, its GPQA artifact passes accuracy, and it strictly improves
+v6's portal ERS. If ERS values are within 0.01, use higher accuracy and then
+lower p95 TTFT as tie-breakers.
 
 For `speculative-draft`, also pass
 `--greedy-comparison artifacts/speculative-draft/greedy-compare.json`; the
 manifest rejects it unless the recorded comparison says every greedy response
-matched the non-speculative parent.
+matched the non-speculative parent, and unless `/metrics` proves a run-scoped,
+reset-free speculative counter delta with observed drafts and mean acceptance
+length at least 3.5.
 
 ## Constraints
 
