@@ -1,9 +1,11 @@
-"""Render one controlled candidate from the v6 incumbent Compose file.
+"""Render one controlled candidate from its declared Compose parent.
 
 The repository keeps ``docker-compose.yml`` as the only submission artifact.
-This helper deliberately starts from that file and changes exactly one
-experiment group at a time.  Render to a temporary path, validate it, and
-promote it to the root file only after a successful portal result.
+This helper deliberately changes exactly one experiment group at a time.
+Most candidates start from the v6 incumbent.  Scheduler children of
+``speculative-draft`` are deliberately named as such and can only inherit a
+digest-pinned, renderer-produced speculative parent; this prevents a later
+batch experiment from silently falling back to v6.
 """
 
 from __future__ import annotations
@@ -22,10 +24,12 @@ V6_REQUIRED_ARGUMENTS = (
     "--kv-cache-dtype=fp8_e4m3",
     "--enable-prefix-caching",
 )
+V6_IMAGE = "vllm/vllm-openai:v0.22.1"
 
 UNCONTROLLED_ARGUMENT_PREFIXES = (
     "--max-num-seqs",
     "--max-num-batched-tokens",
+    "--speculative-config",
     "--enable-chunked-prefill",
     "--async-scheduling",
     "--performance-mode",
@@ -33,10 +37,28 @@ UNCONTROLLED_ARGUMENT_PREFIXES = (
     "--calculate-kv-scales",
 )
 
+SPECULATIVE_DRAFT_ARGUMENT = (
+    '--speculative-config={"method":"draft_model",'
+    '"model":"/opt/draft/LFM2.5-350M",'
+    '"num_speculative_tokens":4,"draft_tensor_parallel_size":1,'
+    '"max_model_len":8192}'
+)
+
 IMAGE_LINE = re.compile(
     r"^(?P<indent>[ \t]*)image:[ \t]*(?P<value>.+?)[ \t]*$", re.MULTILINE
 )
 COMMAND_ITEM = re.compile(r"^(?P<indent>\s*)-\s+(?P<value>.+?)\s*$")
+CONTROLLED_CANDIDATE_LINE = re.compile(
+    r"^# Controlled candidate:[ \t]*(?P<name>[a-z0-9][a-z0-9-]*)[ \t]*$",
+    re.MULTILINE,
+)
+PARENT_CANDIDATE_LINE = re.compile(
+    r"^# Parent candidate:[ \t]*(?P<name>[a-z0-9][a-z0-9-]*)[ \t]*$",
+    re.MULTILINE,
+)
+PARENT_COMPOSE_SHA_LINE = re.compile(r"^# Parent Compose SHA-256: [0-9a-f]{64}[ \t]*$")
+LEGACY_SOURCE_SHA_LINE = re.compile(r"^# Source v6 Compose SHA-256: [0-9a-f]{64}[ \t]*$")
+CHANGE_LINE = re.compile(r"^# Change: .*$", re.MULTILINE)
 # The contest accepts custom images only from public Docker Hub repositories.
 # Keep the renderer fail-closed: a digest alone does not make a GHCR/private
 # registry image eligible for submission.  Docker Hub accepts the short form
@@ -60,6 +82,8 @@ class Candidate:
     description: str
     additional_arguments: tuple[str, ...] = ()
     requires_custom_image: bool = False
+    parent_candidate: str = "v6-incumbent"
+    requires_digest_pinned_parent: bool = False
 
 
 CANDIDATES: dict[str, Candidate] = {
@@ -75,12 +99,7 @@ CANDIDATES: dict[str, Candidate] = {
     "speculative-draft": Candidate(
         "speculative-draft",
         "v6 with the baked local LFM2.5-350M draft model (4 draft tokens).",
-        additional_arguments=(
-            '--speculative-config={"method":"draft_model",'
-            '"model":"/opt/draft/LFM2.5-350M",'
-            '"num_speculative_tokens":4,"draft_tensor_parallel_size":1,'
-            '"max_model_len":8192}',
-        ),
+        additional_arguments=(SPECULATIVE_DRAFT_ARGUMENT,),
         requires_custom_image=True,
     ),
     "batch1536": Candidate(
@@ -92,6 +111,22 @@ CANDIDATES: dict[str, Candidate] = {
         "batch1024",
         "v6 with only max-num-batched-tokens=1024 changed.",
         additional_arguments=("--max-num-batched-tokens=1024",),
+    ),
+    "speculative-draft-batch1536": Candidate(
+        "speculative-draft-batch1536",
+        "The digest-pinned speculative-draft parent with only "
+        "max-num-batched-tokens=1536 changed.",
+        additional_arguments=("--max-num-batched-tokens=1536",),
+        parent_candidate="speculative-draft",
+        requires_digest_pinned_parent=True,
+    ),
+    "speculative-draft-batch1024": Candidate(
+        "speculative-draft-batch1024",
+        "The digest-pinned speculative-draft parent with only "
+        "max-num-batched-tokens=1024 changed.",
+        additional_arguments=("--max-num-batched-tokens=1024",),
+        parent_candidate="speculative-draft",
+        requires_digest_pinned_parent=True,
     ),
 }
 
@@ -125,13 +160,69 @@ def _command_item_value(line: str) -> str | None:
     return _unquote_yaml_scalar(match.group("value"))
 
 
-def validate_v6_source(compose_text: str) -> None:
-    """Reject a source that is not the narrow v6 baseline for experiments."""
-    command_arguments = {
+def _command_arguments(compose_text: str) -> list[str]:
+    return [
         argument
         for line in compose_text.splitlines()
         if (argument := _command_item_value(line)) is not None
-    }
+    ]
+
+
+def _metadata_value(
+    compose_text: str, pattern: re.Pattern[str], label: str
+) -> str | None:
+    matches = [match.group("name") for match in pattern.finditer(compose_text)]
+    if len(matches) > 1:
+        raise ValueError(
+            f"Expected at most one {label} metadata line; found {len(matches)}"
+        )
+    return matches[0] if matches else None
+
+
+def _strip_renderer_metadata(compose_text: str) -> str:
+    """Drop a prior renderer header before adding the new candidate metadata.
+
+    A scheduler child must contain one current candidate identity, not a stack
+    of parent headers that could be misread as multiple controlled changes.
+    Only a complete header at the very beginning is removed; normal Compose
+    comments are left untouched.
+    """
+    lines = compose_text.splitlines(keepends=True)
+    if not lines or not CONTROLLED_CANDIDATE_LINE.fullmatch(lines[0].rstrip("\r\n")):
+        return compose_text
+
+    required_patterns = (
+        PARENT_CANDIDATE_LINE,
+        PARENT_COMPOSE_SHA_LINE,
+        CHANGE_LINE,
+    )
+    if len(lines) >= 4 and all(
+        pattern.fullmatch(lines[index].rstrip("\r\n"))
+        for index, pattern in enumerate(required_patterns, start=1)
+    ):
+        return "".join(lines[4:])
+
+    # Accept an artifact rendered by the previous helper version so that it
+    # can be re-rendered for review, but never remove an incomplete header.
+    legacy_patterns = (LEGACY_SOURCE_SHA_LINE, CHANGE_LINE)
+    if len(lines) >= 3 and all(
+        pattern.fullmatch(lines[index].rstrip("\r\n"))
+        for index, pattern in enumerate(legacy_patterns, start=1)
+    ):
+        return "".join(lines[3:])
+    return compose_text
+
+
+def _compose_image(compose_text: str) -> str:
+    matches = [match for match in IMAGE_LINE.finditer(compose_text)]
+    if len(matches) != 1:
+        raise ValueError(
+            "Expected exactly one Compose image line; found " + str(len(matches))
+        )
+    return _unquote_yaml_scalar(matches[0].group("value"))
+
+
+def _validate_v6_arguments(command_arguments: list[str]) -> None:
     missing = [
         argument for argument in V6_REQUIRED_ARGUMENTS if argument not in command_arguments
     ]
@@ -140,16 +231,99 @@ def validate_v6_source(compose_text: str) -> None:
             "Source Compose is not the v6 incumbent; missing " + ", ".join(missing)
         )
 
-    unexpected = []
-    for line in compose_text.splitlines():
-        argument = _command_item_value(line)
-        if argument and argument.startswith(UNCONTROLLED_ARGUMENT_PREFIXES):
-            unexpected.append(argument)
+
+def _uncontrolled_arguments(
+    command_arguments: list[str], *, allowed: tuple[str, ...] = ()
+) -> list[str]:
+    return [
+        argument
+        for argument in command_arguments
+        if argument.startswith(UNCONTROLLED_ARGUMENT_PREFIXES)
+        and argument not in allowed
+    ]
+
+
+def validate_v6_source(compose_text: str) -> None:
+    """Reject a source that is not the narrow v6 baseline for experiments."""
+    controlled_candidate = _metadata_value(
+        compose_text, CONTROLLED_CANDIDATE_LINE, "controlled candidate"
+    )
+    if controlled_candidate not in {None, "v6-incumbent"}:
+        raise ValueError(
+            "Source Compose is a controlled "
+            f"{controlled_candidate} candidate, not the v6 incumbent"
+        )
+
+    command_arguments = _command_arguments(compose_text)
+    _validate_v6_arguments(command_arguments)
+    image = _compose_image(compose_text)
+    if image != V6_IMAGE:
+        raise ValueError(
+            "Source Compose is not the v6 incumbent; expected image " + V6_IMAGE
+        )
+    unexpected = _uncontrolled_arguments(command_arguments)
     if unexpected:
         raise ValueError(
             "Source Compose contains scheduler/performance experiments that are "
             "not part of v6: " + ", ".join(unexpected)
         )
+
+
+def validate_speculative_draft_parent(compose_text: str) -> None:
+    """Validate the exact, immutable parent accepted by speculative schedulers."""
+    controlled_candidate = _metadata_value(
+        compose_text, CONTROLLED_CANDIDATE_LINE, "controlled candidate"
+    )
+    parent_candidate = _metadata_value(
+        compose_text, PARENT_CANDIDATE_LINE, "parent candidate"
+    )
+    if (
+        controlled_candidate != "speculative-draft"
+        or parent_candidate != "v6-incumbent"
+    ):
+        raise ValueError(
+            "Scheduler children of speculative decoding require a renderer-produced "
+            "speculative-draft parent"
+        )
+
+    command_arguments = _command_arguments(compose_text)
+    _validate_v6_arguments(command_arguments)
+    speculative_arguments = [
+        argument
+        for argument in command_arguments
+        if argument.startswith("--speculative-config")
+    ]
+    if speculative_arguments != [SPECULATIVE_DRAFT_ARGUMENT]:
+        raise ValueError(
+            "Speculative parent must contain exactly the approved 4-token "
+            "LFM2.5-350M --speculative-config"
+        )
+    unexpected = _uncontrolled_arguments(
+        command_arguments, allowed=(SPECULATIVE_DRAFT_ARGUMENT,)
+    )
+    if unexpected:
+        raise ValueError(
+            "Speculative parent contains scheduler/performance experiments that are "
+            "not part of the approved parent: " + ", ".join(unexpected)
+        )
+
+    image = _compose_image(compose_text)
+    if not DOCKER_HUB_DIGEST_IMAGE.fullmatch(image):
+        raise ValueError(
+            "Speculative parent image must be a Docker Hub namespace/repository "
+            "pinned by @sha256:<64 hex chars>"
+        )
+
+
+def validate_source_for_candidate(candidate: Candidate, compose_text: str) -> None:
+    """Validate the declared parent before applying the candidate's one change."""
+    if candidate.parent_candidate == "v6-incumbent":
+        validate_v6_source(compose_text)
+        return
+    if candidate.parent_candidate == "speculative-draft":
+        validate_speculative_draft_parent(compose_text)
+        return
+    raise ValueError(f"Unsupported parent candidate: {candidate.parent_candidate}")
 
 
 def _replace_image(compose_text: str, image: str) -> str:
@@ -203,7 +377,7 @@ def render_compose(
     except KeyError as exc:
         raise ValueError(f"Unknown candidate: {candidate_name}") from exc
 
-    validate_v6_source(source_compose)
+    validate_source_for_candidate(candidate, source_compose)
     if candidate.requires_custom_image:
         if not custom_image:
             raise ValueError(f"{candidate.name} requires --custom-image pinned by digest")
@@ -214,9 +388,13 @@ def render_compose(
                 "before promotion"
             )
     elif custom_image:
+        if candidate.requires_digest_pinned_parent:
+            raise ValueError(
+                f"{candidate.name} must inherit the image from its validated parent"
+            )
         raise ValueError(f"{candidate.name} must keep the incumbent image")
 
-    rendered = source_compose
+    rendered = _strip_renderer_metadata(source_compose)
     if custom_image:
         rendered = _replace_image(rendered, custom_image)
     for argument in candidate.additional_arguments:
@@ -224,7 +402,8 @@ def render_compose(
 
     header = (
         f"# Controlled candidate: {candidate.name}\n"
-        f"# Source v6 Compose SHA-256: {sha256_text(source_compose)}\n"
+        f"# Parent candidate: {candidate.parent_candidate}\n"
+        f"# Parent Compose SHA-256: {sha256_text(source_compose)}\n"
         f"# Change: {candidate.description}\n"
     )
     return header + rendered
@@ -237,7 +416,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--source",
         type=Path,
         default=Path("docker-compose.yml"),
-        help="v6 incumbent Compose file; defaults to the root submission artifact",
+        help=(
+            "Declared parent Compose file; defaults to the root v6 incumbent. "
+            "speculative-draft-batch* requires the rendered speculative-draft "
+            "parent."
+        ),
     )
     parser.add_argument(
         "--custom-image",

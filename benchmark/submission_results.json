@@ -1,5 +1,5 @@
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "selection_policy": {
     "minimum_accuracy": 0.32,
     "preferred_accuracy": 0.35,
@@ -15,7 +15,8 @@
       "greedy_equivalence": true,
       "metrics_scope": "benchmark_delta",
       "counter_reset_detected": false,
-      "minimum_mean_acceptance_length": 3.5
+      "minimum_mean_acceptance_length": 3.5,
+      "bound_run_manifest": true
     },
     "tie_breakers": [
       "higher_accuracy",

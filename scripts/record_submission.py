@@ -11,6 +11,7 @@ from typing import Any
 
 
 EXPECTED_WORKLOAD_REQUESTS = 420
+MANIFEST_SCHEMA_VERSION = 4
 MINIMUM_ACCURACY = 0.32
 PREFERRED_ACCURACY = 0.35
 SPECULATIVE_MIN_MEAN_ACCEPTANCE_LENGTH = 3.5
@@ -21,10 +22,23 @@ CANDIDATES = (
     INCUMBENT,
     "shortconv-fp8",
     "speculative-draft",
+    "speculative-draft-batch1536",
+    "speculative-draft-batch1024",
     "batch1536",
     "batch1024",
 )
-CUSTOM_IMAGE_CANDIDATES = {"shortconv-fp8", "speculative-draft"}
+SPECULATIVE_DRAFT_CANDIDATES = frozenset(
+    {
+        "speculative-draft",
+        "speculative-draft-batch1536",
+        "speculative-draft-batch1024",
+    }
+)
+# Scheduler children retain the draft image and therefore must retain every
+# provenance, equivalence, and measured-acceptance requirement of their
+# speculative parent.  Keeping them explicit avoids silently treating a
+# custom-image child as an ordinary v6 scheduler sweep.
+CUSTOM_IMAGE_CANDIDATES = {"shortconv-fp8", *SPECULATIVE_DRAFT_CANDIDATES}
 DIGEST = re.compile(r"^sha256:[0-9a-fA-F]{64}$")
 # A custom contest image must be served publicly from Docker Hub.  This is a
 # syntactic fail-closed check; the publishing workflow separately verifies an
@@ -39,6 +53,7 @@ DOCKER_HUB_DIGEST_IMAGE = re.compile(
 IMAGE_LINE = re.compile(
     r"^[ \t]*image:[ \t]*(?P<value>.+?)[ \t]*$", re.MULTILINE
 )
+COMMIT_SHA = re.compile(r"^[0-9a-fA-F]{40}$")
 
 
 def sha256(path: Path) -> str:
@@ -139,7 +154,7 @@ def passes_preflight(record: dict[str, Any]) -> bool:
 
 def passes_greedy_equivalence(record: dict[str, Any]) -> bool:
     """Speculative decoding must preserve the captured greedy parent output."""
-    if candidate_name(record) != "speculative-draft":
+    if candidate_name(record) not in SPECULATIVE_DRAFT_CANDIDATES:
         return True
     artifact = record.get("greedy_comparison")
     if not isinstance(artifact, dict):
@@ -156,7 +171,7 @@ def passes_speculative_evidence(record: dict[str, Any]) -> bool:
     The threshold is a preflight gate, not a claim that T4 latency predicts the
     H200 portal score.
     """
-    if candidate_name(record) != "speculative-draft":
+    if candidate_name(record) not in SPECULATIVE_DRAFT_CANDIDATES:
         return True
     benchmark = _benchmark_summary(record)
     if not isinstance(benchmark, dict):
@@ -182,6 +197,49 @@ def passes_speculative_evidence(record: dict[str, Any]) -> bool:
     return drafts > 0 and mean_acceptance_length >= SPECULATIVE_MIN_MEAN_ACCEPTANCE_LENGTH
 
 
+def passes_speculative_run_manifest(record: dict[str, Any]) -> bool:
+    """Require compact identity evidence even for a hand-edited manifest.
+
+    ``build_record`` verifies the full hashed artifact. This second check keeps
+    the selection layer fail-closed when it is given a pre-existing JSON
+    manifest rather than a freshly recorded submission.
+    """
+    candidate = candidate_name(record)
+    if candidate not in SPECULATIVE_DRAFT_CANDIDATES:
+        return True
+    artifact = record.get("run_manifest")
+    if not isinstance(artifact, dict):
+        return False
+    summary = artifact.get("summary")
+    if not isinstance(summary, dict):
+        return False
+    portal_candidate = summary.get("portal_candidate")
+    workload = summary.get("workload")
+    if not isinstance(portal_candidate, dict) or not isinstance(workload, dict):
+        return False
+    if (
+        portal_candidate.get("candidate") != candidate
+        or portal_candidate.get("source_equivalent_preflight") is not True
+        or portal_candidate.get("image_reference") != record.get("image_reference")
+        or portal_candidate.get("image_digest") != record.get("image_digest")
+        or portal_candidate.get("compose_sha256") != record.get("compose_sha256")
+    ):
+        return False
+    repository_commit = summary.get("repository_commit")
+    if not isinstance(repository_commit, str) or not COMMIT_SHA.fullmatch(repository_commit):
+        return False
+    return (
+        isinstance(summary.get("profile"), str)
+        and summary["profile"].startswith("speculative-draft")
+        and workload.get("expected_requests") == EXPECTED_WORKLOAD_REQUESTS
+        and workload.get("seed") == 42
+        and workload.get("request_rate") == "inf"
+        and workload.get("output_tokens") == 300
+        and isinstance(workload.get("trace_sha256"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", workload["trace_sha256"]) is not None
+    )
+
+
 def passes_custom_image_provenance(record: dict[str, Any]) -> bool:
     """Keep hand-edited manifests from bypassing Docker Hub/digest validation."""
     if candidate_name(record) not in CUSTOM_IMAGE_CANDIDATES:
@@ -201,6 +259,7 @@ def _eligible(record: dict[str, Any]) -> bool:
         and passes_preflight(record)
         and passes_greedy_equivalence(record)
         and passes_speculative_evidence(record)
+        and passes_speculative_run_manifest(record)
         and passes_custom_image_provenance(record)
     )
 
@@ -213,9 +272,11 @@ def _choose_with_ties(records: list[dict[str, Any]]) -> dict[str, Any]:
         for item in records
         if top_ers - normalized_ers(item) < ERS_TIE_THRESHOLD
     ]
+
     def accuracy_for_tie_break(item: dict[str, Any]) -> float:
-        if candidate_name(item) != INCUMBENT:
-            return artifact_gpqa_accuracy(item) or -1.0
+        artifact_accuracy = artifact_gpqa_accuracy(item)
+        if artifact_accuracy is not None:
+            return artifact_accuracy
         try:
             return float(item["accuracy"])
         except (KeyError, TypeError, ValueError):
@@ -253,8 +314,11 @@ def choose_best(records: list[dict[str, Any]]) -> dict[str, Any] | None:
         ]
     if not challengers:
         return incumbent
-    winner = _choose_with_ties(challengers)
-    return winner
+    # The published decision policy applies the <0.01 ERS tie-break against
+    # the incumbent too.  This is meaningful once the required baseline GPQA
+    # artifact is recorded; otherwise the historical incumbent's legacy
+    # accuracy field remains the conservative fallback.
+    return _choose_with_ties(([incumbent] if incumbent else []) + challengers)
 
 
 def _display_path(path: Path) -> str:
@@ -284,6 +348,108 @@ def _file_artifact(path: Path | None, label: str) -> dict[str, str] | None:
     if not resolved.is_file():
         raise FileNotFoundError(f"{label} file does not exist: {resolved}")
     return {"path": _display_path(resolved), "sha256": sha256(resolved)}
+
+
+def _require_mapping(value: Any, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be an object")
+    return value
+
+
+def _require_equal(value: Any, expected: Any, label: str) -> None:
+    if value != expected:
+        raise ValueError(f"{label} does not match the submitted candidate")
+
+
+def _validate_speculative_run_manifest(
+    data: Any,
+    *,
+    candidate: str,
+    compose_sha256: str,
+    image_reference: str | None,
+    image_digest: str | None,
+    metrics_sha256: str | None,
+    gpqa_sha256: str | None,
+    greedy_sha256: str | None,
+    resolved_config_sha256: str | None,
+    startup_log_sha256: str | None,
+) -> None:
+    """Reject evidence that is not bound to the submitted draft Compose.
+
+    Colab is source-equivalent rather than a Docker execution environment, so
+    the run manifest must explicitly bind its reproducible source preflight to
+    the immutable image and Compose generated by the release workflow.
+    """
+    manifest = _require_mapping(data, "--run-manifest")
+    portal_candidate = _require_mapping(
+        manifest.get("portal_candidate"), "run manifest portal_candidate"
+    )
+    _require_equal(portal_candidate.get("candidate"), candidate, "run manifest candidate")
+    _require_equal(
+        portal_candidate.get("source_equivalent_preflight"),
+        True,
+        "run manifest source_equivalent_preflight",
+    )
+    _require_equal(
+        portal_candidate.get("image_reference"), image_reference, "run manifest image reference"
+    )
+    _require_equal(
+        portal_candidate.get("image_digest"), image_digest, "run manifest image digest"
+    )
+    _require_equal(
+        portal_candidate.get("compose_sha256"), compose_sha256, "run manifest Compose SHA-256"
+    )
+
+    repository_commit = manifest.get("repository_commit")
+    if not isinstance(repository_commit, str) or not COMMIT_SHA.fullmatch(repository_commit):
+        raise ValueError("run manifest must contain a 40-character repository_commit")
+    profile = manifest.get("profile")
+    if not isinstance(profile, str) or not profile.startswith("speculative-draft"):
+        raise ValueError("run manifest must use a speculative-draft Colab profile")
+
+    workload = _require_mapping(manifest.get("workload"), "run manifest workload")
+    required_workload = {
+        "expected_requests": EXPECTED_WORKLOAD_REQUESTS,
+        "seed": 42,
+        "request_rate": "inf",
+        "output_tokens": 300,
+    }
+    for key, expected in required_workload.items():
+        _require_equal(workload.get(key), expected, f"run manifest workload {key}")
+    if not isinstance(workload.get("trace_sha256"), str) or not re.fullmatch(
+        r"[0-9a-f]{64}", workload["trace_sha256"]
+    ):
+        raise ValueError("run manifest workload trace_sha256 is missing or invalid")
+
+    artifact_hashes = _require_mapping(
+        manifest.get("artifact_sha256"), "run manifest artifact_sha256"
+    )
+    expected_hashes = {
+        "metrics": metrics_sha256,
+        "gpqa": gpqa_sha256,
+        "greedy_comparison": greedy_sha256,
+        "resolved_vllm_config": resolved_config_sha256,
+        "startup_log": startup_log_sha256,
+    }
+    for key, expected in expected_hashes.items():
+        if expected is None:
+            raise ValueError(f"{candidate} requires {key} evidence")
+        _require_equal(artifact_hashes.get(key), expected, f"run manifest {key} SHA-256")
+
+
+def _summary_from_run_manifest(data: Any) -> dict[str, Any] | None:
+    if not isinstance(data, dict):
+        return None
+    portal_candidate = data.get("portal_candidate")
+    workload = data.get("workload")
+    hashes = data.get("artifact_sha256")
+    return {
+        "repository_commit": data.get("repository_commit"),
+        "profile": data.get("profile"),
+        "portal_candidate": portal_candidate if isinstance(portal_candidate, dict) else None,
+        "workload": workload if isinstance(workload, dict) else None,
+        "artifact_sha256": hashes if isinstance(hashes, dict) else None,
+    }
 
 
 def _summary_from_metrics(
@@ -371,6 +537,7 @@ def build_record(args: argparse.Namespace) -> dict[str, Any]:
     compose = args.compose.resolve() if args.compose else None
     if compose is None or not compose.is_file():
         raise FileNotFoundError("A valid --compose file is required")
+    compose_sha256 = sha256(compose)
 
     reference = args.image_reference or _image_reference(compose)
     reference_digest = _digest_from_reference(reference)
@@ -404,14 +571,41 @@ def build_record(args: argparse.Namespace) -> dict[str, Any]:
             raise ValueError(
                 f"{args.candidate} requires " + ", ".join(missing)
             )
-    if args.candidate == "speculative-draft" and args.greedy_comparison is None:
-        raise ValueError("speculative-draft requires --greedy-comparison")
+    if args.candidate in SPECULATIVE_DRAFT_CANDIDATES and args.greedy_comparison is None:
+        raise ValueError(f"{args.candidate} requires --greedy-comparison")
+    if args.candidate in SPECULATIVE_DRAFT_CANDIDATES and args.run_manifest is None:
+        raise ValueError(f"{args.candidate} requires --run-manifest")
 
     metrics = _json_artifact(args.metrics, "metrics")
     gpqa = _json_artifact(args.gpqa, "GPQA")
     greedy_comparison = _json_artifact(args.greedy_comparison, "greedy comparison")
     resolved_config = _json_artifact(args.resolved_vllm_config, "resolved vLLM config")
     startup_log = _file_artifact(args.startup_log, "startup log")
+    run_manifest = _json_artifact(args.run_manifest, "run manifest")
+    if args.candidate in SPECULATIVE_DRAFT_CANDIDATES:
+        if not all(
+            (
+                metrics,
+                gpqa,
+                greedy_comparison,
+                resolved_config,
+                startup_log,
+                run_manifest,
+            )
+        ):
+            raise ValueError(f"{args.candidate} is missing required preflight evidence")
+        _validate_speculative_run_manifest(
+            run_manifest["data"],
+            candidate=args.candidate,
+            compose_sha256=compose_sha256,
+            image_reference=reference,
+            image_digest=digest,
+            metrics_sha256=metrics["sha256"],
+            gpqa_sha256=gpqa["sha256"],
+            greedy_sha256=greedy_comparison["sha256"],
+            resolved_config_sha256=resolved_config["sha256"],
+            startup_log_sha256=startup_log["sha256"],
+        )
     if metrics:
         metrics["summary"] = _summary_from_metrics(metrics["data"], args.candidate)
         del metrics["data"]
@@ -423,6 +617,9 @@ def build_record(args: argparse.Namespace) -> dict[str, Any]:
             greedy_comparison["data"]
         )
         del greedy_comparison["data"]
+    if run_manifest:
+        run_manifest["summary"] = _summary_from_run_manifest(run_manifest["data"])
+        del run_manifest["data"]
 
     recorded_accuracy = args.accuracy
     if args.candidate != INCUMBENT:
@@ -456,12 +653,12 @@ def build_record(args: argparse.Namespace) -> dict[str, Any]:
                 "--metrics must prove a healthy 420/420 benchmark with zero failures, "
                 "and the matching --preflight-successful-requests must be 420"
             )
-        if args.candidate == "speculative-draft":
+        if args.candidate in SPECULATIVE_DRAFT_CANDIDATES:
             speculative_record = dict(preflight_record)
             speculative_record["metrics"] = metrics
             if not passes_speculative_evidence(speculative_record):
                 raise ValueError(
-                    "speculative-draft requires benchmark-delta speculative metrics "
+                    f"{args.candidate} requires benchmark-delta speculative metrics "
                     "with no reset, observed drafts, and mean acceptance length >= "
                     f"{SPECULATIVE_MIN_MEAN_ACCEPTANCE_LENGTH:.1f}"
                 )
@@ -471,14 +668,14 @@ def build_record(args: argparse.Namespace) -> dict[str, Any]:
             }
             if not passes_greedy_equivalence(greedy_record):
                 raise ValueError(
-                    "speculative-draft requires a greedy comparison that matches its parent"
+                    f"{args.candidate} requires a greedy comparison that matches its parent"
                 )
 
     return {
         "candidate": args.candidate,
         "submission_id": args.submission_id,
         "compose_file": _display_path(compose),
-        "compose_sha256": sha256(compose),
+        "compose_sha256": compose_sha256,
         "image_reference": reference,
         "image_digest": digest,
         "resolved_vllm_config": resolved_config,
@@ -486,6 +683,7 @@ def build_record(args: argparse.Namespace) -> dict[str, Any]:
         "gpqa": gpqa,
         "greedy_comparison": greedy_comparison,
         "startup_log": startup_log,
+        "run_manifest": run_manifest,
         "ers": args.ers,
         "ers_normalized": normalized_ers({"ers": args.ers}),
         "accuracy": recorded_accuracy,
@@ -511,7 +709,7 @@ def build_record(args: argparse.Namespace) -> dict[str, Any]:
 
 def _new_manifest() -> dict[str, Any]:
     return {
-        "schema_version": 3,
+        "schema_version": MANIFEST_SCHEMA_VERSION,
         "selection_policy": {
             "minimum_accuracy": MINIMUM_ACCURACY,
             "preferred_accuracy": PREFERRED_ACCURACY,
@@ -530,6 +728,7 @@ def _new_manifest() -> dict[str, Any]:
                 "minimum_mean_acceptance_length": (
                     SPECULATIVE_MIN_MEAN_ACCEPTANCE_LENGTH
                 ),
+                "bound_run_manifest": True,
             },
             "tie_breakers": ["higher_accuracy", "lower_p95_ttft_ms"],
         },
@@ -548,6 +747,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--metrics", type=Path)
     parser.add_argument("--gpqa", type=Path)
     parser.add_argument("--greedy-comparison", type=Path)
+    parser.add_argument(
+        "--run-manifest",
+        type=Path,
+        help="Colab source-equivalent preflight manifest required by draft candidates",
+    )
     parser.add_argument("--startup-log", "--log", dest="startup_log", type=Path)
     parser.add_argument("--ers", type=float, required=True)
     parser.add_argument("--accuracy", type=float)
@@ -600,7 +804,9 @@ def main() -> int:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     else:
         manifest = _new_manifest()
-    manifest["schema_version"] = max(int(manifest.get("schema_version", 0)), 3)
+    manifest["schema_version"] = max(
+        int(manifest.get("schema_version", 0)), MANIFEST_SCHEMA_VERSION
+    )
     default_policy = _new_manifest()["selection_policy"]
     policy = manifest.setdefault("selection_policy", {})
     if not isinstance(policy, dict):

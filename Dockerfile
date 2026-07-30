@@ -29,6 +29,9 @@ RUN case "${ENABLE_SHORTCONV_FP8}" in \
 # The default path does not download a second model. Supplying
 # --build-arg BAKE_DRAFT_MODEL=1 downloads the pinned draft checkpoint into
 # /opt/draft/LFM2.5-350M at build time, so serving can remain fully offline.
+# The helper fails closed unless the draft LICENSE is present, preserves any
+# upstream NOTICE, and records SHA-256 metadata for every legal file in
+# BUILD_MANIFEST.
 RUN BAKE_DRAFT_MODEL="${BAKE_DRAFT_MODEL}" \
     DRAFT_MODEL_ID="${DRAFT_MODEL_ID}" \
     DRAFT_MODEL_REVISION="${DRAFT_MODEL_REVISION}" \

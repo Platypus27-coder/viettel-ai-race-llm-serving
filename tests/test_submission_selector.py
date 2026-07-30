@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -92,6 +93,31 @@ def challenger(
     if candidate in RECORDER.CUSTOM_IMAGE_CANDIDATES:
         record.setdefault("image_reference", CUSTOM_IMAGE)
         record.setdefault("image_digest", CUSTOM_DIGEST)
+    if candidate in RECORDER.SPECULATIVE_DRAFT_CANDIDATES:
+        record.setdefault("compose_sha256", "d" * 64)
+        record.setdefault(
+            "run_manifest",
+            {
+                "summary": {
+                    "repository_commit": "b" * 40,
+                    "profile": "speculative-draft-v6-fp8-smoke",
+                    "portal_candidate": {
+                        "candidate": candidate,
+                        "image_reference": record["image_reference"],
+                        "image_digest": record["image_digest"],
+                        "compose_sha256": record["compose_sha256"],
+                        "source_equivalent_preflight": True,
+                    },
+                    "workload": {
+                        "expected_requests": 420,
+                        "seed": 42,
+                        "request_rate": "inf",
+                        "output_tokens": 300,
+                        "trace_sha256": "c" * 64,
+                    },
+                }
+            },
+        )
     if "gpqa" not in overrides:
         record["gpqa"] = {
             "summary": {
@@ -119,6 +145,7 @@ class SubmissionSelectorTests(unittest.TestCase):
         rendered = SELECTOR.render_compose(
             "speculative-draft", V6_COMPOSE, CUSTOM_IMAGE
         )
+        self.assertIn("# Parent candidate: v6-incumbent", rendered)
         self.assertIn("--speculative-config=", rendered)
         self.assertIn('"method":"draft_model"', rendered)
         self.assertIn('"model":"/opt/draft/LFM2.5-350M"', rendered)
@@ -135,6 +162,74 @@ class SubmissionSelectorTests(unittest.TestCase):
                 self.assertIn(f"--max-num-batched-tokens={budget}", rendered)
                 self.assertNotIn("--max-num-seqs", rendered)
                 self.assertNotIn("--speculative-config", rendered)
+
+    def test_speculative_scheduler_children_inherit_the_pinned_parent(self) -> None:
+        parent = SELECTOR.render_compose(
+            "speculative-draft", V6_COMPOSE, CUSTOM_IMAGE
+        )
+        parent_arguments = SELECTOR._command_arguments(parent)
+        for name, budget in (
+            ("speculative-draft-batch1536", 1536),
+            ("speculative-draft-batch1024", 1024),
+        ):
+            with self.subTest(candidate=name):
+                rendered = SELECTOR.render_compose(name, parent)
+                rendered_arguments = SELECTOR._command_arguments(rendered)
+                self.assertIn(f"# Controlled candidate: {name}", rendered)
+                self.assertIn("# Parent candidate: speculative-draft", rendered)
+                self.assertIn(
+                    f"# Parent Compose SHA-256: {SELECTOR.sha256_text(parent)}",
+                    rendered,
+                )
+                self.assertEqual(rendered.count("# Controlled candidate:"), 1)
+                self.assertIn(f"image: {CUSTOM_IMAGE}", rendered)
+                self.assertIn(SELECTOR.SPECULATIVE_DRAFT_ARGUMENT, rendered_arguments)
+                self.assertEqual(
+                    set(rendered_arguments) - set(parent_arguments),
+                    {f"--max-num-batched-tokens={budget}"},
+                )
+                self.assertEqual(set(parent_arguments) - set(rendered_arguments), set())
+
+    def test_speculative_scheduler_children_reject_non_speculative_or_unpinned_parent(
+        self,
+    ) -> None:
+        for name in (
+            "speculative-draft-batch1536",
+            "speculative-draft-batch1024",
+        ):
+            with self.subTest(candidate=name, parent="v6"):
+                with self.assertRaisesRegex(ValueError, "renderer-produced"):
+                    SELECTOR.render_compose(name, V6_COMPOSE)
+
+        parent = SELECTOR.render_compose(
+            "speculative-draft", V6_COMPOSE, CUSTOM_IMAGE
+        )
+        unpinned = parent.replace(
+            f"image: {CUSTOM_IMAGE}", "image: vllm/vllm-openai:v0.22.1"
+        )
+        with self.assertRaisesRegex(ValueError, "Docker Hub"):
+            SELECTOR.render_compose("speculative-draft-batch1536", unpinned)
+
+    def test_speculative_scheduler_children_reject_mutated_parent_or_image_override(
+        self,
+    ) -> None:
+        parent = SELECTOR.render_compose(
+            "speculative-draft", V6_COMPOSE, CUSTOM_IMAGE
+        )
+        mutated_config = parent.replace('"num_speculative_tokens":4', '"num_speculative_tokens":5')
+        with self.assertRaisesRegex(ValueError, "approved 4-token"):
+            SELECTOR.render_compose("speculative-draft-batch1536", mutated_config)
+        with self.assertRaisesRegex(ValueError, "inherit the image"):
+            SELECTOR.render_compose(
+                "speculative-draft-batch1536", parent, CUSTOM_IMAGE
+            )
+
+    def test_legacy_batch_candidates_cannot_silently_use_speculative_parent(self) -> None:
+        parent = SELECTOR.render_compose(
+            "speculative-draft", V6_COMPOSE, CUSTOM_IMAGE
+        )
+        with self.assertRaisesRegex(ValueError, "not the v6 incumbent"):
+            SELECTOR.render_compose("batch1536", parent)
 
     def test_custom_candidate_requires_an_immutable_digest(self) -> None:
         with self.assertRaisesRegex(ValueError, "pinned by digest"):
@@ -241,6 +336,11 @@ class SubmissionSelectorTests(unittest.TestCase):
         self.assertIsNotNone(best)
         self.assertEqual(best["candidate"], "speculative-draft")
 
+        speculative.pop("run_manifest")
+        best = RECORDER.choose_best([incumbent(), speculative])
+        self.assertIsNotNone(best)
+        self.assertEqual(best["candidate"], "v6-incumbent")
+
     def test_speculative_candidate_rejects_weak_or_reset_acceptance_evidence(self) -> None:
         speculative = challenger(
             "speculative-draft",
@@ -270,6 +370,19 @@ class SubmissionSelectorTests(unittest.TestCase):
         best = RECORDER.choose_best([lower_accuracy, higher_accuracy])
         self.assertIsNotNone(best)
         self.assertEqual(best["candidate"], "batch1024")
+
+    def test_accuracy_breaks_a_near_tie_against_the_incumbent(self) -> None:
+        baseline = incumbent()
+        baseline["gpqa"] = {
+            "summary": {
+                "task": "gpqa_diamond",
+                "metrics": {"acc,none": 0.40},
+            }
+        }
+        lower_accuracy = challenger("shortconv-fp8", 61.415, accuracy=0.32)
+        best = RECORDER.choose_best([baseline, lower_accuracy])
+        self.assertIsNotNone(best)
+        self.assertEqual(best["candidate"], "v6-incumbent")
 
     def test_manifest_summary_can_read_a_controlled_comparison_report(self) -> None:
         summary = RECORDER._summary_from_metrics(
@@ -362,6 +475,91 @@ class SubmissionSelectorTests(unittest.TestCase):
         self.assertNotIn("data", record["metrics"])
         self.assertNotIn("data", record["gpqa"])
         self.assertEqual(record["startup_log"]["sha256"], "log-sha")
+
+    def test_speculative_scheduler_record_requires_bound_preflight_manifest(self) -> None:
+        parent = SELECTOR.render_compose("speculative-draft", V6_COMPOSE, CUSTOM_IMAGE)
+        child = SELECTOR.render_compose("speculative-draft-batch1536", parent)
+        metrics_data = {
+            "runs": [
+                {
+                    "expected_requests": 420,
+                    "successful_requests": 420,
+                    "failed_requests": 0,
+                    "speculative_decoding": measured_speculative_evidence(),
+                }
+            ]
+        }
+        gpqa_data = {"results": {"gpqa_diamond": {"acc,none": 0.36}}}
+        greedy_data = {"matches_expected": True, "responses": []}
+        resolved_data = {"max_num_seqs": 256, "chunked_prefill": True}
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            compose = root / "candidate.yml"
+            metrics = root / "metrics.json"
+            gpqa = root / "gpqa.json"
+            greedy = root / "greedy.json"
+            resolved = root / "resolved.json"
+            startup_log = root / "vllm.log"
+            run_manifest = root / "run_manifest.json"
+            compose.write_text(child, encoding="utf-8")
+            metrics.write_text(json.dumps(metrics_data), encoding="utf-8")
+            gpqa.write_text(json.dumps(gpqa_data), encoding="utf-8")
+            greedy.write_text(json.dumps(greedy_data), encoding="utf-8")
+            resolved.write_text(json.dumps(resolved_data), encoding="utf-8")
+            startup_log.write_text("resolved settings", encoding="utf-8")
+            manifest_data = {
+                "repository_commit": "b" * 40,
+                "profile": "speculative-draft-v6-fp8-smoke",
+                "portal_candidate": {
+                    "candidate": "speculative-draft-batch1536",
+                    "image_reference": CUSTOM_IMAGE,
+                    "image_digest": CUSTOM_DIGEST,
+                    "compose_sha256": RECORDER.sha256(compose),
+                    "source_equivalent_preflight": True,
+                },
+                "workload": {
+                    "expected_requests": 420,
+                    "seed": 42,
+                    "request_rate": "inf",
+                    "output_tokens": 300,
+                    "trace_sha256": "c" * 64,
+                },
+                "artifact_sha256": {
+                    "metrics": RECORDER.sha256(metrics),
+                    "gpqa": RECORDER.sha256(gpqa),
+                    "greedy_comparison": RECORDER.sha256(greedy),
+                    "resolved_vllm_config": RECORDER.sha256(resolved),
+                    "startup_log": RECORDER.sha256(startup_log),
+                },
+            }
+            run_manifest.write_text(json.dumps(manifest_data), encoding="utf-8")
+            args = RECORDER.build_parser().parse_args(
+                [
+                    "--candidate", "speculative-draft-batch1536",
+                    "--compose", str(compose),
+                    "--metrics", str(metrics),
+                    "--gpqa", str(gpqa),
+                    "--greedy-comparison", str(greedy),
+                    "--resolved-vllm-config", str(resolved),
+                    "--startup-log", str(startup_log),
+                    "--run-manifest", str(run_manifest),
+                    "--ers", "75",
+                    "--healthcheck-passed",
+                    "--preflight-successful-requests", "420",
+                ]
+            )
+            record = RECORDER.build_record(args)
+            self.assertEqual(record["candidate"], "speculative-draft-batch1536")
+            self.assertEqual(
+                record["run_manifest"]["summary"]["portal_candidate"]["image_digest"],
+                CUSTOM_DIGEST,
+            )
+
+            manifest_data["portal_candidate"]["compose_sha256"] = "0" * 64
+            run_manifest.write_text(json.dumps(manifest_data), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Compose SHA-256"):
+                RECORDER.build_record(args)
 
     def test_manifest_record_rejects_non_docker_hub_custom_image(self) -> None:
         compose = Path(__file__).parents[1] / "docker-compose.yml"

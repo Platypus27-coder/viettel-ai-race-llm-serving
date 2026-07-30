@@ -189,13 +189,21 @@ jobs:
               jq -e \
                 --arg model_id "$expected_draft_model_id" \
                 --arg revision "$expected_draft_revision" \
-                '.model_id == $model_id
+                '.schema_version == 2
+                 and .model_id == $model_id
                  and .revision == $revision
                  and (.required_files | type == "array")
                  and (.required_files | index("config.json") != null)
                  and (.required_files | index("model.safetensors") != null)
                  and (.required_files | index("tokenizer.json") != null)
-                 and (.required_files | index("tokenizer_config.json") != null)' \
+                 and (.required_files | index("tokenizer_config.json") != null)
+                 and (.legal_files | type == "array" and length > 0)
+                 and any(.legal_files[];
+                         (.path | type == "string")
+                         and (.path | ascii_upcase | startswith("LICENSE"))
+                         and (.sha256 | type == "string" and test("^[0-9a-f]{64}$"))
+                         and (.size_bytes | type == "number"))
+                 and (.notice_present | type == "boolean")' \
                 "$manifest_path" >/dev/null
               echo "Verified offline speculative draft manifest in ${image_ref}."
               ;;

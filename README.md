@@ -61,10 +61,29 @@ The serving process must have the contest-mounted target model at `/model` and
 must not need the network.
 
 For Colab, open
-[the validation notebook](https://colab.research.google.com/github/Platypus27-coder/viettel-ai-race-llm-serving/blob/main/notebooks/colab_benchmark.ipynb).
+[the validation notebook](https://colab.research.google.com/github/Platypus27-coder/viettel-ai-race-llm-serving/blob/candidate/speculative-draft/notebooks/colab_benchmark.ipynb).
 It clones this repository and installs the official CUDA 12.9 vLLM wheel. If a
 previous runtime imported a CUDA 13 vLLM build, choose **Runtime → Restart
 session** before rerunning the setup cell.
+
+Before the setup cell for speculative validation, pin the release identity:
+
+```python
+os.environ['VIETTEL_COLAB_PROFILE'] = 'speculative-draft-v6-fp8-smoke'
+os.environ['VIETTEL_REPO_REF'] = 'candidate/speculative-draft'
+os.environ['VIETTEL_EXPECTED_REPO_SHA'] = '<published-candidate-commit>'
+os.environ['VIETTEL_IMAGE_REFERENCE'] = 'yahiisenpai/viettel-ai-vllm@sha256:<64-hex>'
+```
+
+The Colab result is explicitly labelled source-equivalent: T4 does not execute
+the published image or predict H200 latency.
+
+For a complete greedy gate, first run `v6-fp8-smoke` with
+`VIETTEL_RUN_FULL_GPQA=1` and retain its post-workload parent artifact. Restart
+the session, then run the speculative profile with the same target revision;
+the notebook refuses to continue unless its post-workload comparison matches
+that parent. An FP16 speculative smoke is triage only and cannot satisfy the
+digest-bound preflight record.
 
 The preflight gate is:
 
@@ -77,7 +96,8 @@ The preflight gate is:
   75-point attempt unless H200 evidence proves otherwise;
 - full GPQA Diamond is retained for v6 and for each quantized candidate; and
 - the result directory contains the benchmark JSON, GPQA JSON, startup log,
-  resolved configuration, Compose SHA-256, and image digest.
+  greedy comparison, resolved configuration, Compose SHA-256, image digest,
+  and bound `run_manifest.json`.
 
 ## Controlled candidates
 
@@ -89,22 +109,27 @@ reference, not a tag.
 # Primary high-upside candidate — v6 plus only the baked LFM2.5-350M draft.
 conda run -n viettel python scripts/select_submission.py `
   --candidate speculative-draft `
-  --custom-image 'DOCKERHUB_USER/viettel-ai-vllm:speculative-draft@sha256:<64-hex>' `
+  --custom-image 'yahiisenpai/viettel-ai-vllm:speculative-draft@sha256:<64-hex>' `
   --output artifacts/speculative-draft.yml
 
 # Diagnostic low-upside A/B — v6 plus only ShortConv FP8 wiring.
 conda run -n viettel python scripts/select_submission.py `
   --candidate shortconv-fp8 `
-  --custom-image 'DOCKERHUB_USER/viettel-ai-vllm:shortconv-fp8@sha256:<64-hex>' `
+  --custom-image 'yahiisenpai/viettel-ai-vllm:shortconv-fp8@sha256:<64-hex>' `
   --output artifacts/shortconv-fp8.yml
 
-# Scheduler-only A/B after choosing a winning parent.
+# Scheduler child of the exact speculative parent. It inherits its digest and
+# draft configuration, and changes only the decode-oriented batch budget.
 conda run -n viettel python scripts/select_submission.py `
-  --candidate batch1536 --output artifacts/batch1536.yml
+  --candidate speculative-draft-batch1536 `
+  --source artifacts/speculative-draft.yml `
+  --output artifacts/speculative-draft-batch1536.yml
 
-# Candidate 4, only if another attempt remains.
+# The next controlled child, only after retaining the winning parent evidence.
 conda run -n viettel python scripts/select_submission.py `
-  --candidate batch1024 --output artifacts/batch1024.yml
+  --candidate speculative-draft-batch1024 `
+  --source artifacts/speculative-draft.yml `
+  --output artifacts/speculative-draft-batch1024.yml
 ```
 
 Validate the rendered file before building/uploading it:
@@ -119,7 +144,7 @@ directly to the root with the explicit guard:
 ```powershell
 conda run -n viettel python scripts/select_submission.py `
   --candidate speculative-draft `
-  --custom-image 'DOCKERHUB_USER/viettel-ai-vllm:speculative-draft@sha256:<64-hex>' `
+  --custom-image 'yahiisenpai/viettel-ai-vllm:speculative-draft@sha256:<64-hex>' `
   --output docker-compose.yml --promote
 ```
 
@@ -168,7 +193,7 @@ a GHCR image is therefore not a valid portal artifact. A Docker Hub namespace
 is unavoidable because it becomes part of the submitted image reference.
 
 No local Docker daemon is needed. Create the public Docker Hub repository
-`<namespace>/viettel-ai-vllm`, then add a read/write Docker Hub access token as
+`yahiisenpai/viettel-ai-vllm`, then add a read/write Docker Hub access token as
 the repository Actions secret `DOCKERHUB_TOKEN` (never paste it into a notebook
 or chat). Add the image-owning namespace once as repository variable
 `DOCKERHUB_NAMESPACE`; if that namespace is an organization, also add the
@@ -177,9 +202,10 @@ member login as `DOCKERHUB_USERNAME`. Run
 from **Actions → Run workflow** and select `speculative-draft`.
 
 The workflow builds either controlled variant, confirms a fresh anonymous
-Docker Hub pull, inspects the baked draft manifest without starting a GPU
-server, validates a digest-pinned review Compose, and uploads that Compose as
-an Action artifact. It deliberately does **not** replace the root Compose:
+Docker Hub pull, validates the baked draft LICENSE/NOTICE manifest without
+starting a GPU server, validates a digest-pinned review Compose, and uploads
+that Compose as an Action artifact. It deliberately does **not** replace the
+root Compose:
 image publication alone is not evidence of a valid 420-request/GPQA candidate.
 Until all gates pass, the root Compose stays on the valid v6 incumbent.
 
@@ -187,14 +213,14 @@ Until all gates pass, the root Compose stays on the valid v6 incumbent.
 
 ```powershell
 docker build --build-arg ENABLE_SHORTCONV_FP8=1 `
-  -t DOCKERHUB_USER/viettel-ai-vllm:shortconv-fp8 .
+  -t yahiisenpai/viettel-ai-vllm:shortconv-fp8 .
 ```
 
 Or use the helper, which never edits `docker-compose.yml` and prints the
 immutable registry reference after a successful push:
 
 ```powershell
-.\scripts\build_and_push.ps1 -DockerHubUsername DOCKERHUB_USER `
+.\scripts\build_and_push.ps1 -DockerHubUsername yahiisenpai `
   -Variant shortconv-fp8
 ```
 
@@ -204,11 +230,11 @@ at build time only. The runtime has `HF_HUB_OFFLINE=1` and
 
 ```powershell
 docker build --build-arg ENABLE_SHORTCONV_FP8=0 --build-arg BAKE_DRAFT_MODEL=1 `
-  -t DOCKERHUB_USER/viettel-ai-vllm:speculative-draft .
+  -t yahiisenpai/viettel-ai-vllm:speculative-draft .
 ```
 
 ```powershell
-.\scripts\build_and_push.ps1 -DockerHubUsername DOCKERHUB_USER `
+.\scripts\build_and_push.ps1 -DockerHubUsername yahiisenpai `
   -Variant speculative-draft
 ```
 
@@ -240,12 +266,13 @@ are hashed; generated artifact content remains ignored):
 ```powershell
 conda run -n viettel python scripts/record_submission.py `
   --candidate speculative-draft --submission-id '<portal-id>' `
-  --compose artifacts/speculative-draft.yml `
-  --metrics artifacts/speculative-draft/benchmark.json `
-  --gpqa artifacts/speculative-draft/gpqa/results.json `
-  --greedy-comparison artifacts/speculative-draft/greedy-compare.json `
+  --compose artifacts/speculative-draft/docker-compose.speculative-draft.yml `
+  --metrics artifacts/speculative-draft/ers-420.json `
+  --gpqa artifacts/speculative-draft/gpqa_diamond.results.json `
+  --greedy-comparison artifacts/speculative-draft/greedy-speculative-comparison.json `
   --startup-log artifacts/speculative-draft/vllm.log `
-  --resolved-vllm-config artifacts/speculative-draft/runtime.json `
+  --resolved-vllm-config artifacts/speculative-draft/startup_resolved_config.json `
+  --run-manifest artifacts/speculative-draft/run_manifest.json `
   --healthcheck-passed --preflight-successful-requests 420 `
   --ers <portal-ers> --accuracy <gpqa-accuracy> --f-delta 1.0 --portal-valid
 ```
