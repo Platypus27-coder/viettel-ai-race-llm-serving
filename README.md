@@ -1,21 +1,16 @@
-# 🏆 Viettel AI Race 2026 — LLM Inference Optimization Challenge
+# Viettel AI Race 2026 — LLM Inference Optimization Challenge
 
 > **Giải Pháp Phục Vụ Tốc Độ Cao Cho Mô Hình LiquidAI LFM2.5-1.2B-Instruct Trực Trên Hạ Tầng MiG NVIDIA H200**
 
-[![Serving Framework](https://img.shields.io/badge/Serving-vLLM%20v0.22.1-blue.svg)](https://github.com/vllm-project/vllm)
-[![GPU Infrastructure](https://img.shields.io/badge/GPU-1x%20MiG%20NVIDIA%20H200%20(18GB)-green.svg)](https://www.nvidia.com)
-[![ERS Score](https://img.shields.io/badge/ERS%20Score-61.4100-orange.svg)](#-phân-tích-kỹ-thuật--giới-hạn-phần-cứng)
-[![Accuracy Gate](https://img.shields.io/badge/Accuracy%20Gate-100%25%20(f(%CE%94)%20%3D%201.0)-brightgreen.svg)](#1-dynamic-weight-fp8-quantization-nén-trọng-số-8-bit)
-
 ---
 
-## 📌 Tổng Quan Giải Pháp (Executive Summary)
+## Tổng Quan Giải Pháp (Executive Summary)
 
 Dự án này triển khai và tối ưu hóa hệ thống suy luận LLM (LLM Inference Server) cho mô hình **`LiquidAI/LFM2.5-1.2B-Instruct`** trong khuôn khổ cuộc thi **Viettel AI Race 2026**.
 
 Hệ thống được thiết kế chuyên biệt để xử lý lưu lượng truy cập thực tế (Production Multi-turn Chat Workload) trên hạ tầng GPU bị giới hạn tài nguyên khắt khe: **1x GPU MiG NVIDIA H200 (18GB VRAM), 3 CPU Cores và 8GB RAM**.
 
-### 🌟 Thành Tựu Đạt Được (Profile v6.0)
+### Thành Tựu Đạt Được (Profile v6.0)
 - **Điểm số ERS Online**: **`61.4100 điểm`** (Thuộc top đầu bảng xếp hạng trực tuyến).
 - **Độ trễ Token đầu (TTFT p50)**: **`45 ms`** (Thời gian phản hồi ban đầu cực kỳ ấn tượng).
 - **Tỷ lệ phục vụ thành công**: **`98.8%`** (415 / 420 requests hoàn tất mượt mà).
@@ -23,7 +18,7 @@ Hệ thống được thiết kế chuyên biệt để xử lý lưu lượng t
 
 ---
 
-## 🛠️ Trụ Cột Tối Ưu Hóa (Core Optimization Levers)
+## Trụ Cột Tối Ưu Hóa (Core Optimization Levers)
 
 Kiến trúc giải pháp v6.0 kết hợp 4 trụ cột công nghệ chính trên nền tảng vLLM v0.22.1:
 
@@ -41,7 +36,7 @@ Kiến trúc giải pháp v6.0 kết hợp 4 trụ cột công nghệ chính tr�
          │                   │                     │                     │
          ▼                   ▼                     ▼                     ▼
 ┌──────────────────┐ ┌───────────────┐ ┌────────────────────────┐ ┌─────────────┐
-│  TBT = 4.0 ms    │ │ Chứa 70 Chat  │ │    TTFT = 45 ms        │ │ Khái Thác   │
+│  TBT = 4.0 ms    │ │ Chứa 70 Chat  │ │    TTFT = 45 ms        │ │ Khai Thác   │
 │ (Nạp VRAM gấp 2) │ │ Lượt Không OOM│ │  (Bỏ Qua 1000 Tokens)  │ │ 18GB VRAM   │
 └──────────────────┘ └───────────────┘ └────────────────────────┘ └─────────────┘
 ```
@@ -64,7 +59,7 @@ Kiến trúc giải pháp v6.0 kết hợp 4 trụ cột công nghệ chính tr�
 
 ---
 
-## 🔬 Phân Tích Kỹ Thuật & Giới Hạn Phần Cứng
+## Phân Tích Kỹ Thuật & Giới Hạn Phần Cứng
 
 ### Tại sao v6.0 là Cấu Hình Tối Ưu Tuyệt Đối?
 
@@ -79,9 +74,9 @@ Trong quá trình thực nghiệm, hệ thống đã thử nghiệm các kỹ th
 
 ---
 
-## 🚀 Hướng Dẫn Triển Khai & Nộp Bài (Deployment Guide)
+## Hướng Dẫn Triển Khai & Nộp Bài (Deployment Guide)
 
-### 📄 Tệp nộp bài chính thức: `docker-compose.yml`
+### Tệp nộp bài chính thức: `docker-compose.yml`
 
 Tệp cấu hình chuẩn được lưu tại thư mục gốc của repository:
 
@@ -144,7 +139,7 @@ services:
               capabilities: [gpu]
 ```
 
-### 🧪 Lệnh Benchmark ERS Nội Bộ (Local Testing):
+### Lệnh Benchmark ERS Nội Bộ (Local Testing):
 ```powershell
 # Chạy mô phỏng benchmark ERS bằng Python trong môi trường conda viettel
 conda run -n viettel python benchmark/benchmark_ers.py --compose-file docker-compose.yml
@@ -152,19 +147,19 @@ conda run -n viettel python benchmark/benchmark_ers.py --compose-file docker-com
 
 ---
 
-## 📊 Bảng Lịch Sử Thử Nghiệm & Kết Quả (Benchmark Matrix)
+## Bảng Lịch Sử Thử Nghiệm & Kết Quả (Benchmark Matrix)
 
 | Phiên bản Profile | Kỹ thuật áp dụng | ERS Score | TTFT p50 | Success Rate | f(Δ) Accuracy | Ghi chú & Trạng thái |
 |---|---|---|---|---|---|---|
 | **Baseline BF16** | Mặc định chưa tối ưu | ~38.20 | 180 ms | 95.0% | 1.0 | Bản gốc vLLM |
 | **v2.0 FP8 Weight** | FP8 Weight Only | 52.10 | 95 ms | 97.2% | 1.0 | Tăng tốc Decode |
-| **v6.0 Incumbent** | **FP8 W + FP8 KV + APC** | **61.4100** | **45 ms** | **98.8%** | **1.0** | **🏆 Đỉnh cao chính thức** |
+| **v6.0 Incumbent** | **FP8 W + FP8 KV + APC** | **61.4100** | **45 ms** | **98.8%** | **1.0** | **Đỉnh cao chính thức** |
 | **batch1536 Exp** | v6.0 + Max Batched Tokens 1536 | 59.9000 | 55 ms | 98.5% | 1.0 | CPU bị trễ prefill queue |
 | **Draft Speculative** | Speculative Draft Model 350M | Failed | N/A | 0.0% | N/A | Lỗi vLLM Hybrid KV Cache |
 
 ---
 
-## 📁 Cấu Trúc Repository (Clean Workspace)
+## Cấu Trúc Repository (Clean Workspace)
 
 ```text
 .
@@ -180,5 +175,5 @@ conda run -n viettel python benchmark/benchmark_ers.py --compose-file docker-com
 
 ---
 
-### 🛡️ Cam Kết Hậu Kiểm (Post-Online Evaluation)
+### Cam Kết Hậu Kiểm (Post-Online Evaluation)
 Bản nộp **v6.0 (61.4100 điểm)** bảo toàn **100% độ chính xác gốc ($f(\Delta) = 1.0$)**, tuân thủ 100% quy định không đụng chạm tokenizer, không hardcode và hoàn toàn sẵn sàng cho bước chấm hậu kiểm GPQA Diamond full của Ban Tổ Chức!
